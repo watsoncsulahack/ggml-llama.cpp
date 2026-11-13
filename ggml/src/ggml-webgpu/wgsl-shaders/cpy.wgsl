@@ -4,6 +4,8 @@ enable f16;
 #define SRC_TYPE f32
 #elif defined(SRC_F16)
 #define SRC_TYPE f16
+#elif defined(SRC_I32)
+#define SRC_TYPE i32
 #endif
 
 #ifdef DST_F32
@@ -49,12 +51,16 @@ struct Params{
 var<uniform> params: Params;
 
 @compute @workgroup_size(WG_SIZE)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= params.ne) {
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let index = gid.x + gid.y * nwg.x * WG_SIZE;
+    if (index >= params.ne) {
         return;
     }
 
-    var i = gid.x;
+    var i = index;
     let i3 = i / (params.src_ne2 * params.src_ne1 * params.src_ne0);
     i = i % (params.src_ne2 * params.src_ne1 * params.src_ne0);
     let i2 = i / (params.src_ne1 * params.src_ne0);
@@ -62,7 +68,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i1 = i / params.src_ne0;
     let i0 = i % params.src_ne0;
 
-    var j = gid.x;
+    var j = index;
     let j3 = j / (params.dst_ne2 * params.dst_ne1 * params.dst_ne0);
     j = j % (params.dst_ne2 * params.dst_ne1 * params.dst_ne0);
     let j2 = j / (params.dst_ne1 * params.dst_ne0);
@@ -78,4 +84,3 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     dst[params.offset_dst + dst_idx] = DST_TYPE((src[params.offset_src + src_idx]));
 }
-

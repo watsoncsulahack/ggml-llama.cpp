@@ -1,8 +1,10 @@
-# common
-
 find_package(Threads REQUIRED)
 
 llama_add_compile_flags()
+
+#
+# llama-common-base
+#
 
 # Build info header
 
@@ -33,57 +35,76 @@ endif()
 
 set(TEMPLATE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/build-info.cpp.in")
 set(OUTPUT_FILE   "${CMAKE_CURRENT_BINARY_DIR}/build-info.cpp")
+
 configure_file(${TEMPLATE_FILE} ${OUTPUT_FILE})
 
-set(TARGET build_info)
-add_library(${TARGET} OBJECT ${OUTPUT_FILE})
+set(TARGET llama-common-base)
+add_library(${TARGET} STATIC ${OUTPUT_FILE})
+
+target_include_directories(${TARGET} PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<INSTALL_INTERFACE:${LLAMA_INCLUDE_INSTALL_DIR}/common>)
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
-set(TARGET common)
+#
+# llama-common
+#
+
+set(TARGET llama-common)
+
+include(parsers/sources.cmake)
 
 set(${TARGET}_HEADERS
-  arg.h
-  base64.hpp
-  chat-auto-parser.h
-  chat-peg-parser.h
-  chat.h
-  common.h
-  console.h
-  debug.h
-  download.h
-  hf-cache.h
-  http.h
-  json-partial.h
-  json-schema-to-grammar.h
-  log.h
-  ngram-cache.h
-  ngram-map.h
-  ngram-mod.h
-  peg-parser.h
-  preset.h
-  reasoning-budget.h
-  regex-partial.h
-  sampling.h
-  speculative.h
-  unicode.h
+    arg.h
+    base64.hpp
+    chat-auto-parser.h
+    chat-peg-parser.h
+    chat.h
+    common.h
+    console.h
+    debug.h
+    download.h
+    finetune.h
+    fit.h   # qvac: declarations for the fit helpers (memory_breakdown_print, get_device_memory_data)
+    hf-cache.h
+    http.h
+    imatrix-loader.h
+    json-schema-to-grammar.h
+    json-schema.h
+    json.h
+    laya.h
+    log.h
+    ngram-cache.h
+    ngram-map.h
+    ngram-mod.h
+    peg-parser.h
+    preset.h
+    reasoning-budget.h
+    sampling.h
+    speculative.h
+    subproc.h
+    trie.h
+    unicode.h
 )
 
 set(${TARGET}_JINJA_HEADERS
-  jinja/caps.h
-  jinja/lexer.h
-  jinja/parser.h
-  jinja/runtime.h
-  jinja/string.h
-  jinja/utils.h
-  jinja/value.h
+    jinja/caps.h
+    jinja/lexer.h
+    jinja/parser.h
+    jinja/runtime.h
+    jinja/string.h
+    jinja/utils.h
+    jinja/value.h
 )
 
 list(TRANSFORM ${TARGET}_HEADERS PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/)
 list(TRANSFORM ${TARGET}_JINJA_HEADERS PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/)
 
 add_library(${TARGET} STATIC
+    ${LLAMA_CHAT_PARSERS_SOURCES}
     arg.cpp
     chat-auto-parser-generator.cpp
     chat-auto-parser-helpers.cpp
@@ -94,9 +115,16 @@ add_library(${TARGET} STATIC
     console.cpp
     debug.cpp
     download.cpp
+    finetune.cpp
+    fit.cpp
     hf-cache.cpp
-    json-partial.cpp
+    imatrix-loader.cpp
     json-schema-to-grammar.cpp
+    json-schema.cpp
+    json-schema.h
+    json.cpp
+    json.h
+    laya.cpp
     llguidance.cpp
     log.cpp
     ngram-cache.cpp
@@ -104,10 +132,11 @@ add_library(${TARGET} STATIC
     ngram-mod.cpp
     peg-parser.cpp
     preset.cpp
-    regex-partial.cpp
     reasoning-budget.cpp
     sampling.cpp
     speculative.cpp
+    subproc.cpp
+    trie.cpp
     unicode.cpp
     jinja/lexer.cpp
     jinja/parser.cpp
@@ -119,18 +148,31 @@ add_library(${TARGET} STATIC
     ${${TARGET}_JINJA_HEADERS}
     )
 
+set_target_properties(${TARGET} PROPERTIES
+    VERSION ${LLAMA_VERSION_BASE}
+    SOVERSION ${LLAMA_VERSION_MAJOR}
+    MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
+)
+
 set_target_properties(${TARGET} PROPERTIES PUBLIC_HEADER "${${TARGET}_HEADERS}")
+target_link_libraries     (${TARGET} PUBLIC vendor::nlohmann vendor::sheredom)
+
 install(FILES ${${TARGET}_JINJA_HEADERS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/llama/common/jinja)
 
-if (BUILD_SHARED_LIBS)
-    set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if (LLAMA_SUBPROCESS)
+    target_compile_definitions(${TARGET} PUBLIC LLAMA_SUBPROCESS)
 endif()
 
-target_link_libraries(${TARGET} PRIVATE
-    build_info
-    cpp-httplib
-)
+if (BUILD_SHARED_LIBS)
+    set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    # TODO: make fine-grained exports in the future
+    set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+endif()
+
+target_link_libraries(${TARGET} PUBLIC  llama-common-base)
+target_link_libraries(${TARGET} PRIVATE cpp-httplib)
 
 if (LLAMA_LLGUIDANCE)
     include(ExternalProject)
@@ -158,12 +200,11 @@ if (LLAMA_LLGUIDANCE)
     add_dependencies(llguidance llguidance_ext)
 
     target_include_directories(${TARGET} PRIVATE ${LLGUIDANCE_PATH})
-    # Add platform libraries to the main target
-    set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} llguidance)
+    target_link_libraries(${TARGET} PRIVATE llguidance)
     if (WIN32)
-        set(LLAMA_COMMON_EXTRA_LIBS ${LLAMA_COMMON_EXTRA_LIBS} ws2_32 userenv ntdll bcrypt)
+        target_link_libraries(${TARGET} PRIVATE ws2_32 userenv ntdll bcrypt)
     endif()
-endif ()
+endif()
 
 target_include_directories(
   ${TARGET}
@@ -173,6 +214,13 @@ target_include_directories(
 
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)
+
+# qvac: rebase onto upstream b9341 renamed the common target to `llama-common`.
+# Keep both names addressable so qvac-side CMakeLists (target `common`) and
+# upstream/example/tool CMakeLists (target `llama-common`) both link.
+if (NOT TARGET common)
+    add_library(common ALIAS ${TARGET})
+endif()
 
 
 #

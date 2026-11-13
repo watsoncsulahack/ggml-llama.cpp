@@ -2,12 +2,16 @@
 
 #include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 #include <cstdio>
 #include "uint8-buff-stream.h"
 #include <future>
 #include <string>
 #include <map>
+
+// staging buffer size for direct I/O reads, 64MB works well for NVMe drives
+#define LLAMA_DIRECT_IO_BUFFER_SIZE (64 * 1024 * 1024)
 
 struct llama_file;
 struct llama_mmap;
@@ -28,6 +32,10 @@ struct llama_file {
 
     virtual void read_raw(void * ptr, size_t len) = 0;
     virtual void read_raw_unsafe(void * ptr, size_t len) { read_raw(ptr, len); }
+#ifndef _WIN32
+    // Position-independent read; returns zero if unsupported. Direct IO requires aligned arguments.
+    virtual size_t read_raw_unsafe_at(void *, size_t, size_t) const { return 0; }
+#endif
     virtual void read_aligned_chunk(void * dest, size_t size) { read_raw(dest, size); }
     virtual uint32_t read_u32() = 0;
 
@@ -36,6 +44,9 @@ struct llama_file {
 
     virtual size_t read_alignment() const { return 1; }
     virtual bool has_direct_io() const { return false; }
+
+    /// @return contiguous in-memory contents, or nullptr if not memory-backed
+    virtual const void * data_ptr() const { return nullptr; }
 };
 
 struct llama_file_disk : public llama_file {
@@ -51,6 +62,9 @@ struct llama_file_disk : public llama_file {
 
     void read_raw(void * ptr, size_t len) override;
     void read_raw_unsafe(void * ptr, size_t len) override;
+#ifndef _WIN32
+    size_t read_raw_unsafe_at(void * ptr, size_t len, size_t offset) const override;
+#endif
     void read_aligned_chunk(void * dest, size_t size) override;
     uint32_t read_u32() override;
 
@@ -87,6 +101,8 @@ template <bool Writable> struct llama_file_buffer : public llama_file {
 
     /// @throw std::runtime_error if the buffer is read-only
     void write_u32(uint32_t val) const override;
+
+    const void * data_ptr() const override;
 
     std::unique_ptr<std::basic_streambuf<char>> streambuf;
 };
@@ -130,8 +146,12 @@ using llama_future_file_buffer_ro = llama_future_file_buffer<false>;
 using llama_future_file_buffer_rw = llama_future_file_buffer<true>;
 
 struct llama_mmap {
+    // list of [first, last) byte ranges within a file
+    using ranges = std::vector<std::pair<size_t, size_t>>;
+
     llama_mmap(const llama_mmap &) = delete;
-    llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false);
+    llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false,
+               const ranges & lazy_ranges = {});
     ~llama_mmap();
 
     size_t size() const;
@@ -159,5 +179,15 @@ private:
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
+
+struct llama_memory_range {
+    const void * addr;
+    size_t size;
+};
+
+using llama_memory_ranges = std::vector<llama_memory_range>;
+
+// Prefetch the host pages covering these memory ranges.
+void llama_prefetch(llama_memory_ranges mr);
 
 size_t llama_path_max();

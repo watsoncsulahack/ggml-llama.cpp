@@ -1,0 +1,48 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+
+struct socket_t;
+typedef std::shared_ptr<socket_t> socket_ptr;
+
+static constexpr size_t MAX_CHUNK_SIZE = 1024ull * 1024ull * 1024ull; // 1 GiB
+static constexpr size_t RPC_CONN_CAPS_SIZE = 24;
+
+struct socket_t {
+    ~socket_t();
+
+    bool send_data(const void * data, size_t size);
+    bool recv_data(void * data, size_t size);
+    bool exchange_data(const void * send_data, void * recv_data, size_t size);
+    // Must be called at every message boundary: the RDMA transport coalesces
+    // writes into fixed-size frames and posts the trailing partial frame only
+    // here. No-op on TCP.
+    bool flush();
+    bool set_timeout(int timeout_ms);
+    void shutdown();
+    // Port the socket is bound to, or -1 on error.
+    int local_port() const;
+
+    socket_ptr accept(int timeout_ms = -1, bool * timed_out = nullptr);
+
+    void get_caps(uint8_t * local_caps);
+    void update_caps(const uint8_t * remote_caps);
+    const char * transport_name() const;
+
+    static socket_ptr create_server(const char * host, int port);
+    static socket_ptr connect(const char * host, int port, int timeout_ms = -1);
+
+private:
+    struct impl;
+    explicit socket_t(std::unique_ptr<impl> p);
+    std::unique_ptr<impl> pimpl;
+};
+
+bool rpc_transport_init();
+void rpc_transport_shutdown();
+
+// True when new connections will try RDMA: the RDMA library loaded, it lists an
+// RDMA device, and GGML_RPC_NO_RDMA is unset. They fall back to TCP when RDMA fails.
+bool rpc_transport_rdma_available();

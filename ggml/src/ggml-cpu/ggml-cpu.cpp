@@ -1,6 +1,10 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
+
+#if defined(__APPLE__) && !defined(_WIN32)
+#include <mach/mach.h>
+#endif
 #include "repack.h"
 #include "traits.h"
 #include "ggml-impl.h"
@@ -167,6 +171,16 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
     GGML_UNUSED(backend);
 }
 
+static size_t ggml_backend_cpu_get_work_size(ggml_backend_t backend) {
+    struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+    return cpu_ctx->work_size;
+}
+
+static size_t ggml_backend_cpu_graph_get_work_size(ggml_backend_t backend, const struct ggml_cgraph * cgraph) {
+    struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+    return ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool).work_size;
+}
+
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
@@ -195,8 +209,8 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
     /* .free                    = */ ggml_backend_cpu_free,
     /* .set_tensor_async        = */ NULL,
     /* .get_tensor_async        = */ NULL,
-    /* .get_tensor_2d_async     = */ NULL,
     /* .set_tensor_2d_async     = */ NULL,
+    /* .get_tensor_2d_async     = */ NULL,
     /* .cpy_tensor_async        = */ NULL,
     /* .synchronize             = */ NULL,
     /* .graph_plan_create       = */ ggml_backend_cpu_graph_plan_create,
@@ -369,6 +383,43 @@ static void ggml_backend_cpu_device_get_memory(ggml_backend_dev_t dev, size_t * 
     GlobalMemoryStatusEx(&status);
     *total = status.ullTotalPhys;
     *free = status.ullAvailPhys;
+#elif defined(__APPLE__)
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    *total = pages * page_size;
+
+    // Physical memory minus what cannot be evicted: wired pages and the
+    // compressor's footprint. Anonymous and file-backed pages are not
+    // subtracted — the kernel compresses or evicts them under pressure.
+    // Reporting total here made every host-memory fit trivially pass: an
+    // 18 GiB model on a 24 GiB machine "fit" regardless of what was running.
+    vm_statistics64_data_t vm_stats;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vm_stats, &count) == KERN_SUCCESS) {
+        const size_t unavailable = ((size_t) vm_stats.wire_count + (size_t) vm_stats.compressor_page_count) * (size_t) page_size;
+        *free = *total > unavailable ? *total - unavailable : 0;
+    } else {
+        *free = *total;
+    }
+#elif defined(__linux__)
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    *total = pages * page_size;
+
+    // MemAvailable is the kernel's own estimate of allocatable memory without
+    // swapping; fall back to total when /proc/meminfo is unavailable.
+    *free = *total;
+    if (FILE * f = fopen("/proc/meminfo", "r")) {
+        char line[128];
+        while (fgets(line, sizeof(line), f)) {
+            unsigned long long kib = 0;
+            if (sscanf(line, "MemAvailable: %llu kB", &kib) == 1) {
+                *free = (size_t) kib * 1024;
+                break;
+            }
+        }
+        fclose(f);
+    }
 #else
     long pages = sysconf(_SC_PHYS_PAGES);
     long page_size = sysconf(_SC_PAGE_SIZE);
@@ -397,6 +448,8 @@ static void ggml_backend_cpu_device_get_props(ggml_backend_dev_t dev, struct ggm
         /* .host_buffer           = */ false,
         /* .buffer_from_host_ptr  = */ true,
         /* .events                = */ false,
+        /* .mmap_support          = */ true,
+        /* .copy_stream           = */ false,
     };
 }
 
@@ -450,11 +503,16 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 op->type != GGML_TYPE_IQ1_S   &&
                 op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
         case GGML_OP_MUL_MAT:
-            return
-                src1->type == GGML_TYPE_F32 ||
-                src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type ||
-                (src0->type == GGML_TYPE_TQ2_0 &&
-                    (src1->type == GGML_TYPE_Q8_1 || src1->type == GGML_TYPE_Q8_0));
+            if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+                src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
+                return src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16;
+            }
+            // BF16 in src1 is widened into the F32 work buffer
+            return src1->type == GGML_TYPE_F32 ||
+                   src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type ||
+                   (src1->type == GGML_TYPE_BF16 && ggml_get_type_traits_cpu(src0->type)->vec_dot_type == GGML_TYPE_F32) ||
+                   (src0->type == GGML_TYPE_TQ2_0 &&
+                       (src1->type == GGML_TYPE_Q8_1 || src1->type == GGML_TYPE_Q8_0));
         case GGML_OP_SOFT_MAX_BACK: {
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
                 return false;
@@ -465,13 +523,27 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
 
             return max_bias == 0.0f;
         }
+        case GGML_OP_FLASH_ATTN_EXT_BACK:
+            return src0->type == GGML_TYPE_F32 &&
+                (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) &&
+                (op->src[2]->type == GGML_TYPE_F32 || op->src[2]->type == GGML_TYPE_F16) &&
+                (!op->src[3] || op->src[3]->type == GGML_TYPE_F16);
         case GGML_OP_IM2COL_BACK:
-            return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32;
+            return src0->type == GGML_TYPE_F32 && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
         case GGML_OP_GET_ROWS_BACK:
             return src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16;
         case GGML_OP_OUT_PROD:
-            return (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || (ggml_is_quantized(src0->type) && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
+            return (src0->type == GGML_TYPE_F32 ||
+                    ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&
                 src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_CONV_2D:
+            return ggml_is_contiguous(op->src[0]);
+        case GGML_OP_SSM_SCAN:
+            return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
+        case GGML_OP_GATED_DELTA_NET_DEFERRED:
+            return ggml_backend_dev_supports_inplace_src(dev, op->src[6]);
+        case GGML_OP_GDN_CONV_DEFERRED:
+            return ggml_backend_dev_supports_inplace_src(dev, op->src[2]);
         default:
             return true;
     }
@@ -598,6 +670,9 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
         if (ggml_cpu_has_sme()) {
             features.push_back({ "SME", "1" });
         }
+        if (ggml_cpu_has_sme2()) {
+            features.push_back({ "SME2", "1" });
+        }
         if (ggml_cpu_has_riscv_v()) {
             features.push_back({ "RISCV_V", "1" });
         }
@@ -644,6 +719,15 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 }
 
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_get_work_size") == 0) {
+        return (void *)ggml_backend_cpu_get_work_size;
+    }
+    if (strcmp(name, "ggml_backend_graph_get_work_size") == 0) {
+        return (void *)ggml_backend_cpu_graph_get_work_size;
+    }
+    if (strcmp(name, "ggml_graph_plan") == 0) {
+        return (void *)ggml_graph_plan;
+    }
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
         return (void *)fct;

@@ -96,6 +96,14 @@ typedef sycl::half2 ggml_half2;
 #define QI1_0 (QK1_0 / 32)
 #define QR1_0 1
 
+#define QI2_0 (QK2_0 / 32)
+#define QR2_0 1
+
+#define QI_PQ2_0 (QK_PQ2_0 / 32)
+#define QR_PQ2_0 1
+#define QI_PTQ1_0 (QK_PTQ1_0 / 32)
+#define QR_PTQ1_0 1
+
 
 #define QI4_0 (QK4_0 / (4 * QR4_0))
 #define QR4_0 2
@@ -123,6 +131,9 @@ typedef sycl::half2 ggml_half2;
 
 #define QI2_K (QK_K / (4*QR2_K))
 #define QR2_K 4
+
+#define QI_TQ2_0 (QK_K / (4*QR_TQ2_0))
+#define QR_TQ2_0 4
 
 #define QI3_K (QK_K / (4*QR3_K))
 #define QR3_K 4
@@ -180,6 +191,30 @@ typedef struct {
     uint8_t qs[QK1_0 / 8]; // bits / quants
 } block_q1_0;
 static_assert(sizeof(block_q1_0) == sizeof(ggml_half) + QK1_0 / 8, "wrong q1_0 block size/padding");
+
+#define QK2_0 64
+typedef struct {
+    ggml_half d;              // delta (scale)
+    uint8_t qs[QK2_0 / 4];   // 2 bits per element
+} block_q2_0;
+static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
+
+// Prism Q2_0 with one fp16 scale per 128 weights.
+#define QK_PQ2_0 128
+typedef struct {
+    ggml_half d;                   // delta (scale)
+    uint8_t qs[QK_PQ2_0 / 4];    // 2 bits per element
+} block_pq2_0;
+static_assert(sizeof(block_pq2_0) == sizeof(ggml_half) + QK_PQ2_0 / 4, "wrong pq2_0 block size/padding");
+
+// Prism ternary packing with one fp16 scale per 128 weights.
+#define QK_PTQ1_0 128
+typedef struct {
+    uint8_t qs[(QK_PTQ1_0 - 4*QK_PTQ1_0/64)/5]; // 24 B, 5 trits per byte -> 120 values
+    uint8_t qh[QK_PTQ1_0/64];                   //  2 B, 4 trits per byte ->   8 values
+    ggml_half d;                                // scale
+} block_ptq1_0;
+static_assert(sizeof(block_ptq1_0) == sizeof(ggml_half) + QK_PTQ1_0/64 + (QK_PTQ1_0 - 4*QK_PTQ1_0/64)/5, "wrong ptq1_0 block size/padding");
 
 #define QK4_0 32
 typedef struct {
@@ -276,120 +311,6 @@ typedef struct {
     ggml_half d;
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
-
-//
-// TurboQuant / PolarQuant quantization (Zandieh et al., ICLR 2026)
-//
-// PolarQuant (pq3_0):  Stage 1 only  — rotation + Lloyd-Max scalar quantization + bit-packing.
-//                      The original "tbq3_0" implementation, renamed to free up the tq3 name.
-// TurboQuant (tbq3_0):  Stage 1 + QJL Stage 2 — adds 1-bit residual sketch for unbiased inner products.
-//
-// Both share identical codebooks, sign arrays, Hadamard transforms, and Stage 1 quantization logic.
-// TQ3 simply appends a QJL sidecar (sign bits of projected residual + residual norm) to each block.
-//
-// Two block sizes: 128 (head_dim is a multiple of 128) and 64 (head_dim=64).
-// The user specifies "tbq3_0" (with QJL) or "pq3_0" (without) on the CLI;
-// the KV cache init selects the _64 variant automatically when head_dim=64
-// and packs wider heads as consecutive 128-element blocks.
-//
-
-#define QK_TQ 128
-
-// QJL sketch dimensions per block size (= number of random projections for Stage 2)
-#define QJL_SKETCH_DIM_128 128
-#define QJL_SKETCH_DIM_64   64
-#define QJL_SKETCH_BYTES_128 (QJL_SKETCH_DIM_128 / 8) // 16 bytes
-#define QJL_SKETCH_BYTES_64  (QJL_SKETCH_DIM_64  / 8) //  8 bytes
-
-// --- PolarQuant 3-bit: Stage 1 only (identical to the former "tbq3_0" layout) ---
-// block=128: 48 index bytes + 2 norm bytes = 50 bytes (3.125 bpw)
-// block=64:  24 index bytes + 2 norm bytes = 26 bytes (3.25 bpw)
-
-#define PQ3_0_INDEX_BYTES ((QK_TQ * 3 + 7) / 8) // 48
-typedef struct {
-    uint8_t   qs[PQ3_0_INDEX_BYTES]; // bit-packed 3-bit codebook indices
-    ggml_half d;                     // L2 norm of original vector
-} block_pq3_0;
-static_assert(sizeof(block_pq3_0) == sizeof(ggml_half) + PQ3_0_INDEX_BYTES, "wrong pq3_0 block size/padding");
-
-// --- TurboQuant 3-bit: Stage 1 + QJL Stage 2 ---
-// block=128: 48 + 2 + 16 + 2 = 68 bytes (4.25 bpw)
-// block=64:  24 + 2 +  8 + 2 = 36 bytes (4.5 bpw)
-// The first two fields (qs, d) are identical to PQ3 for codebook compatibility.
-// The QJL sidecar stores sign(R * residual) and ||residual||.
-
-#define TBQ3_0_INDEX_BYTES PQ3_0_INDEX_BYTES // same codebook indices as PQ3
-typedef struct {
-    uint8_t   qs[TBQ3_0_INDEX_BYTES];      // bit-packed 3-bit codebook indices (Stage 1)
-    ggml_half d;                           // L2 norm of original vector
-    uint8_t   qjl[QJL_SKETCH_BYTES_128];  // Stage 2: sign bits of R * residual
-    ggml_half d_r;                         // Stage 2: L2 norm of residual
-} block_tbq3_0;
-static_assert(sizeof(block_tbq3_0) == 2*sizeof(ggml_half) + TBQ3_0_INDEX_BYTES + QJL_SKETCH_BYTES_128,
-              "wrong tbq3_0 block size/padding");
-
-// --- PolarQuant 4-bit: Stage 1 only ---
-// block=128: 64 index bytes + 2 norm bytes = 66 bytes (4.125 bpw)
-// block=64:  32 index bytes + 2 norm bytes = 34 bytes (4.25 bpw)
-
-#define PQ4_0_INDEX_BYTES (QK_TQ / 2) // 64
-typedef struct {
-    uint8_t   qs[PQ4_0_INDEX_BYTES]; // packed 4-bit codebook indices (2 per byte)
-    ggml_half d;                     // L2 norm of original vector
-} block_pq4_0;
-static_assert(sizeof(block_pq4_0) == sizeof(ggml_half) + PQ4_0_INDEX_BYTES, "wrong pq4_0 block size/padding");
-
-// --- TurboQuant 4-bit: Stage 1 + QJL Stage 2 ---
-// block=128: 64 + 2 + 16 + 2 = 84 bytes (5.25 bpw)
-// block=64:  32 + 2 +  8 + 2 = 44 bytes (5.5 bpw)
-
-#define TBQ4_0_INDEX_BYTES PQ4_0_INDEX_BYTES
-typedef struct {
-    uint8_t   qs[TBQ4_0_INDEX_BYTES];      // packed 4-bit codebook indices (Stage 1)
-    ggml_half d;                           // L2 norm of original vector
-    uint8_t   qjl[QJL_SKETCH_BYTES_128];  // Stage 2: sign bits of R * residual
-    ggml_half d_r;                         // Stage 2: L2 norm of residual
-} block_tbq4_0;
-static_assert(sizeof(block_tbq4_0) == 2*sizeof(ggml_half) + TBQ4_0_INDEX_BYTES + QJL_SKETCH_BYTES_128,
-              "wrong tbq4_0 block size/padding");
-
-// --- block size 64 (head_dim=64: Llama-3.2-1B/3B) ---
-
-#define QK_TQ_64 64
-
-#define PQ3_0_64_INDEX_BYTES ((QK_TQ_64 * 3 + 7) / 8) // 24
-typedef struct {
-    uint8_t   qs[PQ3_0_64_INDEX_BYTES];
-    ggml_half d;
-} block_pq3_0_64;
-static_assert(sizeof(block_pq3_0_64) == sizeof(ggml_half) + PQ3_0_64_INDEX_BYTES, "wrong pq3_0_64 block size/padding");
-
-#define TBQ3_0_64_INDEX_BYTES PQ3_0_64_INDEX_BYTES
-typedef struct {
-    uint8_t   qs[TBQ3_0_64_INDEX_BYTES];
-    ggml_half d;
-    uint8_t   qjl[QJL_SKETCH_BYTES_64];
-    ggml_half d_r;
-} block_tbq3_0_64;
-static_assert(sizeof(block_tbq3_0_64) == 2*sizeof(ggml_half) + TBQ3_0_64_INDEX_BYTES + QJL_SKETCH_BYTES_64,
-              "wrong tbq3_0_64 block size/padding");
-
-#define PQ4_0_64_INDEX_BYTES (QK_TQ_64 / 2) // 32
-typedef struct {
-    uint8_t   qs[PQ4_0_64_INDEX_BYTES];
-    ggml_half d;
-} block_pq4_0_64;
-static_assert(sizeof(block_pq4_0_64) == sizeof(ggml_half) + PQ4_0_64_INDEX_BYTES, "wrong pq4_0_64 block size/padding");
-
-#define TBQ4_0_64_INDEX_BYTES PQ4_0_64_INDEX_BYTES
-typedef struct {
-    uint8_t   qs[TBQ4_0_64_INDEX_BYTES];
-    ggml_half d;
-    uint8_t   qjl[QJL_SKETCH_BYTES_64];
-    ggml_half d_r;
-} block_tbq4_0_64;
-static_assert(sizeof(block_tbq4_0_64) == 2*sizeof(ggml_half) + TBQ4_0_64_INDEX_BYTES + QJL_SKETCH_BYTES_64,
-              "wrong tbq4_0_64 block size/padding");
 
 //
 // Super-block quantization structures
@@ -562,6 +483,16 @@ typedef struct {
     uint8_t  qs[QK_K/2];
 } block_iq4_xs;
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
+
+// TurboQuant/PolarQuant block layouts are only consumed by host C/C++ code (CPU
+// quant + type traits). The GPU-shader DECL contexts (Metal/CUDA/HIP/SYCL/MUSA)
+// define their own quant layouts and must not pull in this standalone host header
+// — e.g. the Metal shader compile of ggml-metal.metal would fail to find it.
+#if !defined(GGML_COMMON_DECL_METAL) && !defined(GGML_COMMON_DECL_CUDA) && \
+    !defined(GGML_COMMON_DECL_HIP)   && !defined(GGML_COMMON_DECL_SYCL) && \
+    !defined(GGML_COMMON_DECL_MUSA)
+#include "ggml-tbq-types.h"
+#endif
 
 #endif // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL
@@ -1225,16 +1156,17 @@ GGML_TABLE_BEGIN(int8_t, kvalues_iq4nl, 16)
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 GGML_TABLE_END()
 
-// e2m1 values (doubled)
+// e2m1 values (doubled), shared by MXFP4 and NVFP4
 // ref: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
-GGML_TABLE_BEGIN(int8_t, kvalues_mxfp4, 16)
+GGML_TABLE_BEGIN(int8_t, kvalues_fp4, 16)
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 GGML_TABLE_END()
+#define kvalues_mxfp4 kvalues_fp4
 
 #define NGRID_IQ1S 2048
 #define IQ1S_DELTA 0.125f
 #define IQ1M_DELTA 0.125f
-#if defined(GGML_COMMON_IMPL_C)
+#if defined(GGML_COMMON_IMPL_C) || defined(GGML_COMMON_IMPL_CPP)
 GGML_TABLE_BEGIN(uint64_t, iq1s_grid, NGRID_IQ1S)
     0xffffffffffffffff, 0xffffffffffffff01, 0xffffffffffff0000, 0xffffffffffff01ff,
     0xffffffffffff0101, 0xffffffffff00ff00, 0xffffffffff000000, 0xffffffffff01ffff,

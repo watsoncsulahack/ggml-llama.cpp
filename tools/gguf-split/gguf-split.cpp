@@ -1,7 +1,10 @@
+#include "llama.h"
+
+#include "build-info.h"
+#include "common.h"
+
 #include "ggml.h"
 #include "gguf.h"
-#include "llama.h"
-#include "common.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -45,6 +48,7 @@ struct split_params {
     std::string output;
     bool no_tensor_first_split = false;
     bool dry_run = false;
+    bool delete_splits = false;
     bool verbose = false;
     std::set<std::string> must_be_followed_layers;
 };
@@ -67,6 +71,7 @@ static void split_print_usage(const char * executable) {
     printf("  --no-tensor-first-split do not add tensors to the first split (disabled by default)\n");
     printf("  --must-be-followed LAYER ensure LAYER is not the last tensor in a split and will not be released when loading after any tensor is created (can be used multiple times)\n");
     printf("  --dry-run               only print out a split plan and exit, without writing any new files\n");
+    printf("  --delete-splits         delete the split files during merge to free up disk space WARNING: this option is unsafe and will leave you in an unrecoverable state if something fails during the merge\n");
     printf("  --verbose               show tensor names for each split\n");
     printf("\n");
 }
@@ -107,8 +112,8 @@ static void split_params_parse_ex(int argc, const char ** argv, split_params & p
             split_print_usage(argv[0]);
             exit(0);
         } else if (arg == "--version") {
-            fprintf(stderr, "version: %d (%s)\n", LLAMA_BUILD_NUMBER, LLAMA_COMMIT);
-            fprintf(stderr, "built with %s for %s\n", LLAMA_COMPILER, LLAMA_BUILD_TARGET);
+            fprintf(stderr, "version: %s (build %d, commit %s)\n", llama_version(), llama_build_number(), llama_commit());
+            fprintf(stderr, "built with %s for %s\n", llama_compiler(), llama_build_target());
             exit(0);
         } else if (arg == "--dry-run") {
             arg_found = true;
@@ -153,6 +158,9 @@ static void split_params_parse_ex(int argc, const char ** argv, split_params & p
             }
             params.mode = MODE_SIZE;
             params.n_bytes_split = split_str_to_n_bytes(argv[arg_idx]);
+        } else if (arg == "--delete-splits") {
+            arg_found = true;
+            params.delete_splits = true;
         } else if (arg == "--must-be-followed") {
             if (++arg_idx >= argc) {
                 invalid_param = true;
@@ -413,6 +421,10 @@ struct split_strategy {
         }
         f_in.seekg(in_offset);
         f_in.read((char *)read_buf.data(), len);
+        if (!f_in) {
+            fprintf(stderr, "%s: failed to read %zu bytes at offset %zu, input file may be truncated\n", __func__, len, in_offset);
+            exit(EXIT_FAILURE);
+        }
         f_out.write((const char *)read_buf.data(), len);
     }
 };
@@ -442,10 +454,10 @@ static void gguf_split(const split_params & split_params) {
     int n_split = strategy.ctx_outs.size();
     strategy.print_info();
 
-    // Write tensor list file
-    strategy.write_tensor_list();
-
     if (!split_params.dry_run) {
+        // Write tensor list file
+        strategy.write_tensor_list();
+
         // write all output splits
         strategy.write();
     }
@@ -568,6 +580,7 @@ static void gguf_merge(const split_params & split_params) {
     }
 
     // Write tensors data
+    bool merge_error = false;
     for (int i_split = 0; i_split < n_split; i_split++) {
         llama_split_path(split_path, sizeof(split_path), split_prefix, i_split, n_split);
         std::ifstream f_input(split_path, std::ios::binary);
@@ -613,6 +626,16 @@ static void gguf_merge(const split_params & split_params) {
         ggml_free(ctx_meta);
         f_input.close();
         fprintf(stderr, "\033[3Ddone\n");
+
+        if (!split_params.dry_run && split_params.delete_splits) {
+            int delete_result = std::remove(split_path);
+            if (delete_result != 0) {
+                merge_error = true;
+                fprintf(stderr, "error: failed to delete %s\n", split_path);
+            } else {
+                fprintf(stderr, "%s: deleted file %s\n", __func__, split_path);
+            }
+        }
     }
 
     if (!split_params.dry_run) {
@@ -627,6 +650,10 @@ static void gguf_merge(const split_params & split_params) {
 
     fprintf(stderr, "%s: %s merged from %d split with %d tensors.\n",
             __func__, split_params.output.c_str(), n_split, total_tensors);
+
+    if (merge_error) {
+        exit(EXIT_FAILURE);
+    }
 }
 
 int main(int argc, const char ** argv) {

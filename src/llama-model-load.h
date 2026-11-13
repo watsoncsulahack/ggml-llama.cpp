@@ -16,7 +16,7 @@ struct gguf_file_load {
     gguf_context_ptr            meta;
     std::unique_ptr<llama_file> file = nullptr;
 
-    gguf_file_load(struct ggml_context ** ctx, load_input_t load_input);
+    gguf_file_load(struct ggml_context ** ctx, load_input_t load_input, bool use_direct_io = false);
 };
 
 /// @brief Stores relevant information to be able to loads a `.gguf` split file when load method is called.
@@ -31,7 +31,8 @@ struct SplitLoad {
               std::string kv_split_no);
 
     static gguf_file_load load_split_gguf(struct ggml_context ** ctx, const char * fname_split,
-                                          load_input_t & load_input, std::vector<std::string> & splits);
+                                          load_input_t & load_input, std::vector<std::string> & splits,
+                                          bool use_direct_io = false);
 
     struct ggml_context * load(struct llama_model_loader & ml);
 };
@@ -66,6 +67,9 @@ struct IncrementalSplitsTensorLoad {
 
     uint16_t get_split_idx_for_tensor(const char * tensor_name) const;
 
+    /// @returns True if the tensor-list file names this tensor, even if its split is not loaded yet.
+    bool is_expected_tensor(const std::string & tensor_name) const { return expected_tensors.count(tensor_name) > 0; }
+
     std::size_t get_split_data_size(uint16_t split_idx) const;
 
     static bool tensor_ignored(const std::optional<IncrementalSplitsTensorLoad> & splits_tensor_load,
@@ -74,7 +78,6 @@ struct IncrementalSplitsTensorLoad {
     /// @brief Lalizy get/allocate a context with enough capacity for all tensors of
     /// same type of an individual split. The context can be used to instantiate the
     /// final model tensors and and attach to them backend buffers.
-    /// @tparam impl The model implementation type where the context will be stored.
     ggml_context * get_model_ctx_for_split_buft(ggml_backend_buffer_type_t buft, uint16_t split) {
         auto key = std::make_pair(buft, split);
         auto it  = ctx_split_map.find(key);

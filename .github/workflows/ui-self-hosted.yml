@@ -1,0 +1,164 @@
+name: UI (self-hosted)
+
+# these are the same as ui.yml, but with self-hosted runners
+# the jobs are lighter because they don't need to install Node.js or Playwright browsers
+# the runner has pre-installed Playwright browsers for @playwright/test (1.56.1) at /ms-playwright/
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Commit SHA1 to build'
+        required: false
+        type: string
+  push:
+    branches:
+      - master
+    paths: [
+      '.github/workflows/ui-self-hosted.yml',
+      '.github/workflows/ui-build-self-hosted.yml',
+      'tools/ui/**.*',
+      'tools/server/tests/**.*'
+    ]
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths: [
+      '.github/workflows/ui-self-hosted.yml',
+      '.github/workflows/ui-build-self-hosted.yml',
+      'tools/ui/**.*',
+      'tools/server/tests/**.*'
+    ]
+
+cache-mode: none
+permissions:
+  actions: read
+  contents: read
+
+env:
+  LLAMA_ARG_LOG_COLORS: 1
+  LLAMA_ARG_LOG_PREFIX: 1
+  LLAMA_ARG_LOG_TIMESTAMPS: 1
+  LLAMA_ARG_LOG_VERBOSITY: 10
+
+# QVAC divergence from upstream. Reachable outcomes:
+#
+#   pull_request                 -> per PR   (supersedes)
+#   workflow_dispatch with `sha` -> per sha  (re-dispatching the SAME commit
+#                                   supersedes; two commits coexist)
+#   push to master               -> per run  (run_id; never cancels)
+#   dispatch on another ref, no sha -> per ref (supersedes)
+#
+# The `sha` arm is load-bearing: without it, two dispatches of different
+# commits from the same non-master ref share a group and cancel each other.
+# See QVAC-24627.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.sha || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  authorize:
+    permissions: {}
+    uses: ./.github/workflows/reusable-authorize-self-hosted.yml
+
+  ui-build:
+    name: Build static output
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
+    uses: ./.github/workflows/ui-build-self-hosted.yml
+    permissions:
+      actions: write
+      contents: read
+
+  ui-checks:
+    name: Checks
+    needs: [ui-build, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
+    runs-on: qvac-ubuntu2404-x64
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.sha || github.event.pull_request.head.sha || github.sha || github.head_ref || github.ref_name }}
+
+      - name: Install dependencies
+        id: setup
+        run: npm ci
+        working-directory: tools/ui
+
+      - name: Install Playwright browser
+        if: ${{ always() && steps.setup.conclusion == 'success' }}
+        run: npx playwright install chromium
+        working-directory: tools/ui
+
+      - name: Download built UI artifacts
+        uses: actions/download-artifact@v6
+        with:
+          name: llama-ui.zip
+          path: tools/ui/dist/
+
+      - name: Run type checking
+        if: ${{ always() && steps.setup.conclusion == 'success' }}
+        run: npm run check
+        working-directory: tools/ui
+
+      - name: Run linting
+        if: ${{ always() && steps.setup.conclusion == 'success' }}
+        run: npm run lint
+        working-directory: tools/ui
+
+      - name: Run Client tests
+        if: ${{ always() && steps.setup.conclusion == 'success' }}
+        run: npm run test:client
+        working-directory: tools/ui
+
+      - name: Run Unit tests
+        if: ${{ always() && steps.setup.conclusion == 'success' }}
+        run: npm run test:unit
+        working-directory: tools/ui
+
+  e2e-tests:
+    name: E2E Tests
+    needs: [ui-build, authorize]
+    if: needs.authorize.outputs.allowed == 'true'
+    runs-on: qvac-ubuntu2404-x64
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.sha || github.event.pull_request.head.sha || github.sha || github.head_ref || github.ref_name }}
+
+      - name: Install dependencies
+        id: setup
+        run: npm ci
+        working-directory: tools/ui
+
+      - name: Install Playwright browser
+        if: ${{ always() && steps.setup.conclusion == 'success' }}
+        run: npx playwright install chromium
+        working-directory: tools/ui
+
+      - name: Download built UI artifacts
+        uses: actions/download-artifact@v6
+        with:
+          name: llama-ui.zip
+          path: tools/ui/dist/
+
+      - name: Build Storybook
+        if: ${{ always() && steps.setup.conclusion == 'success' }}
+        run: npm run build-storybook
+        working-directory: tools/ui
+
+      - name: Run UI tests
+        if: ${{ always() && steps.setup.conclusion == 'success' }}
+        run: npm run test:ui -- --testTimeout=60000
+        working-directory: tools/ui
+
+      - name: Run E2E tests
+        if: ${{ always() && steps.setup.conclusion == 'success' }}
+        run: npm run test:e2e
+        working-directory: tools/ui

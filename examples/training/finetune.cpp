@@ -93,10 +93,9 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (params.use_mmap) {
-        LOG_INF("%s: force disabling memory mapping because it would result in-read-only pointers to the weights\n",
-                __func__);
-        params.use_mmap = false;
+    if (params.load_mode != LLAMA_LOAD_MODE_NONE) {
+        LOG_INF("%s: forcing load_mode = none to enable writable pointers to the weights\n", __func__);
+        params.load_mode = LLAMA_LOAD_MODE_NONE;
     }
     const bool supports_out_prod_f16 = training_supports_out_prod_f16(params);
     if (!supports_out_prod_f16) {
@@ -112,6 +111,8 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
     llama_numa_init(params.numa);
+    params.training = true;
+
     // load the model and apply lora adapter, if any
     auto llama_init = common_init_from_params(params);
 

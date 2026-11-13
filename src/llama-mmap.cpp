@@ -6,6 +6,7 @@
 
 #include <cstring>
 #include <climits>
+#include <cstdlib>
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
@@ -40,6 +41,14 @@
 
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
+#endif
+
+#ifdef _WIN32
+#    define llama_mmap_ftell _ftelli64
+#    define llama_mmap_fseek _fseeki64
+#else
+#    define llama_mmap_ftell ftello
+#    define llama_mmap_fseek fseeko
 #endif
 
 // TODO: consider moving to llama-impl.h if needed in more places
@@ -226,7 +235,7 @@ struct llama_file_disk::impl {
 
     size_t tell() const {
         if (fd == -1) {
-            long ret = std::ftell(fp);
+            off_t ret = llama_mmap_ftell(fp);
             if (ret == -1) {
                 throw std::runtime_error(format("ftell error: %s", strerror(errno)));
             }
@@ -244,7 +253,7 @@ struct llama_file_disk::impl {
     void seek(size_t offset, int whence) const {
         off_t ret = 0;
         if (fd == -1) {
-            ret = std::fseek(fp, (long) offset, whence);
+            ret = llama_mmap_fseek(fp, offset, whence);
         } else {
             ret = lseek(fd, offset, whence);
         }
@@ -288,7 +297,7 @@ struct llama_file_disk::impl {
                         alignment = 1;
                         init_fp("rb");
                         seek(curr_off, SEEK_SET);
-                        read_raw_unsafe(ptr, len);
+                        read_raw_unsafe(static_cast<char *>(ptr) + bytes_read, len - bytes_read);
                         return;
                     }
                     throw std::runtime_error(format("read error: %s", strerror(errno)));
@@ -308,28 +317,82 @@ struct llama_file_disk::impl {
         }
     }
 
-    void read_aligned_chunk(void * dest, size_t size) {
-        size_t offset = tell();
-        off_t aligned_offset = offset & ~(alignment - 1);
-        off_t offset_from_alignment = offset - aligned_offset;
-        size_t bytes_to_read = (offset_from_alignment + size + alignment - 1) & ~(alignment - 1);
+    size_t read_raw_unsafe_at(void * ptr, size_t len, size_t offset) const {
+        int read_fd = fd != -1 ? fd : fileno(fp);
+        std::unique_ptr<FILE, int (*)(FILE *)> buffered(nullptr, &std::fclose);
+        size_t done = 0;
+        while (done < len) {
+            ssize_t ret = pread(read_fd, static_cast<char *>(ptr) + done, len - done, offset + done);
+            if (ret < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (fd != -1 && !buffered && (errno == EINVAL || errno == EFAULT)) {
+                    LLAMA_LOG_WARN("%s: Falling back to buffered IO due to %s\n", __func__, strerror(errno));
+                    // Keep the direct-IO descriptor valid for the other readers.
+                    buffered.reset(ggml_fopen(fname.c_str(), "rb"));
+                    if (!buffered) {
+                        throw std::runtime_error(format("failed to open %s: %s", fname.c_str(), strerror(errno)));
+                    }
+                    read_fd = fileno(buffered.get());
+                    continue;
+                }
+                throw std::runtime_error(format("pread failed: %s", strerror(errno)));
+            }
+            if (ret == 0) {
+                break;
+            }
+            done += static_cast<size_t>(ret);
+        }
+        return done;
+    }
 
-        void * raw_buffer = nullptr;
-        int ret = posix_memalign(&raw_buffer, alignment, bytes_to_read);
-        if (ret != 0) {
-            throw std::runtime_error(format("posix_memalign failed with error %d", ret));
+    void read_aligned_chunk(void * dest, size_t size) {
+        struct read_buffer {
+            void * data = nullptr;
+            size_t capacity = 0;
+            size_t alignment = 0;
+            ~read_buffer() { free(data); }
+        };
+        // Share a bounded buffer across all shards read by this thread.
+        thread_local read_buffer bounce;
+        size_t offset = tell();
+        if (offset > this->size || size > this->size - offset) {
+            throw std::runtime_error("unexpectedly reached end of file");
         }
 
-        struct aligned_buffer_deleter {
-            void operator()(void * p) const { free(p); }
-        };
-        std::unique_ptr<void, aligned_buffer_deleter> buffer(raw_buffer);
+        while (size > 0) {
+            if (!has_direct_io()) {
+                seek(offset, SEEK_SET);
+                read_raw_unsafe(dest, size);
+                return;
+            }
+            const size_t aligned_offset = offset & ~(alignment - 1);
+            const size_t skip = offset - aligned_offset;
+            const size_t limit = std::max<size_t>(8 * 1024 * 1024, alignment);
+            const size_t bytes_to_read = std::min(limit, (skip + size + alignment - 1) & ~(alignment - 1));
+            const size_t to_copy = std::min(size, bytes_to_read - skip);
 
-        seek(aligned_offset, SEEK_SET);
-        read_raw_unsafe(buffer.get(), bytes_to_read);
+            if (bytes_to_read > bounce.capacity || alignment > bounce.alignment) {
+                void * data = nullptr;
+                int ret = posix_memalign(&data, alignment, bytes_to_read);
+                if (ret != 0) {
+                    throw std::runtime_error(format("posix_memalign failed with error %d", ret));
+                }
+                free(bounce.data);
+                bounce.data = data;
+                bounce.capacity = bytes_to_read;
+                bounce.alignment = alignment;
+            }
 
-        uintptr_t actual_data = reinterpret_cast<uintptr_t>(buffer.get()) + offset_from_alignment;
-        memcpy(dest, reinterpret_cast<void *>(actual_data), size);
+            seek(aligned_offset, SEEK_SET);
+            read_raw_unsafe(bounce.data, bytes_to_read);
+            memcpy(dest, static_cast<char *>(bounce.data) + skip, to_copy);
+            dest = static_cast<char *>(dest) + to_copy;
+            offset += to_copy;
+            size -= to_copy;
+        }
+        seek(offset, SEEK_SET);
     }
 
     void read_raw(void * ptr, size_t len) {
@@ -419,6 +482,9 @@ void llama_file_disk::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, le
 void llama_file_disk::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
 #else
 void llama_file_disk::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
+size_t llama_file_disk::read_raw_unsafe_at(void * ptr, size_t len, size_t offset) const {
+    return pimpl->read_raw_unsafe_at(ptr, len, offset);
+}
 #endif
 
 #ifdef _WIN32
@@ -454,12 +520,14 @@ template <bool Writable> int llama_file_buffer<Writable>::file_id() const {
 }
 
 template <bool Writable> void llama_file_buffer<Writable>::seek(size_t offset, int whence) const {
-    static std::map<int, std::ios_base::seekdir> whence_to_dir = {
-        { SEEK_SET, std::ios_base::beg },
-        { SEEK_CUR, std::ios_base::cur },
-        { SEEK_END, std::ios_base::end }
-    };
-    auto result = streambuf->pubseekoff(offset, whence_to_dir.at(whence));
+    std::ios_base::seekdir dir;
+    switch (whence) {
+        case SEEK_SET: dir = std::ios_base::beg; break;
+        case SEEK_CUR: dir = std::ios_base::cur; break;
+        case SEEK_END: dir = std::ios_base::end; break;
+        default:       throw std::out_of_range("invalid whence");
+    }
+    auto result = streambuf->pubseekoff(offset, dir);
     if (result == std::streampos(-1)) {
         throw std::runtime_error("seek failed");
     }
@@ -485,10 +553,7 @@ template <> void llama_file_buffer<false>::write_raw([[maybe_unused]] const void
 }
 
 template <> void llama_file_buffer<false>::write_u32(uint32_t val) const {
-    if (val > 0) {
-        // Cannot directly set [[noreturn]] for a function since it was defined without it.
-        throw std::runtime_error("buffer is not writable");
-    }
+    write_raw(&val, sizeof(val));
 }
 
 template <> void llama_file_buffer<true>::write_raw(const void * ptr, size_t len) const {
@@ -496,6 +561,11 @@ template <> void llama_file_buffer<true>::write_raw(const void * ptr, size_t len
     if (bytes_written != static_cast<std::streamsize>(len)) {
         throw std::runtime_error("write beyond end of buffer");
     }
+}
+
+template <bool Writable> const void * llama_file_buffer<Writable>::data_ptr() const {
+    const auto * buf = dynamic_cast<const Uint8BufferStreamBuf *>(streambuf.get());
+    return buf != nullptr ? buf->data_ptr() : nullptr;
 }
 
 template <> void llama_file_buffer<true>::write_u32(uint32_t val) const {
@@ -540,7 +610,7 @@ ensure_promise_registry(const std::string & key) {
     }
     auto result =
         promise_registry<Writable>().emplace(key, std::promise<std::unique_ptr<llama_file_buffer<Writable>>>());
-    LLAMA_LOG_CMAKE_DEBUG("%s: created future file buffer %p for %s\n", __func__, (void *) &(*it), key.c_str());
+    LLAMA_LOG_CMAKE_DEBUG("%s: created future file buffer %p for %s\n", __func__, (void *) &(*result.first), key.c_str());
     return result.first;
 }
 }  // namespace
@@ -589,12 +659,9 @@ bool llama_future_file_buffer<Writable>::fulfill_promise(const std::string & pro
                                                          std::unique_ptr<llama_file_buffer<Writable>> && value) {
     std::string key = final_key(promise_key, context);
     auto        it  = ensure_promise_registry<Writable>(key);
-    if (it != promise_registry<Writable>().end()) {
-        LLAMA_LOG_CMAKE_DEBUG("fulfilling future file buffer %p for %s\n", (void *) &(*it), key.c_str());
-        it->second.set_value(std::move(value));
-        return true;
-    }
-    return false;
+    LLAMA_LOG_CMAKE_DEBUG("fulfilling future file buffer %p for %s\n", (void *) &(*it), key.c_str());
+    it->second.set_value(std::move(value));
+    return true;
 }
 
 template <bool Writable>
@@ -614,11 +681,34 @@ template struct llama_future_file_buffer<true>;
 
 // llama_mmap
 
+#if defined(_POSIX_MAPPED_FILES) || defined(_WIN32)
+// merge `ranges` and return their complement within [0, limit)
+static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t limit) {
+    llama_mmap::ranges res;
+    std::sort(ranges.begin(), ranges.end());
+
+    size_t pos = 0;
+    for (const auto & range : ranges) {
+        const size_t beg = std::min(range.first,  limit);
+        const size_t end = std::min(range.second, limit);
+        if (beg > pos) {
+            res.emplace_back(pos, beg);
+        }
+        pos = std::max(pos, end);
+    }
+    if (pos < limit) {
+        res.emplace_back(pos, limit);
+    }
+
+    return res;
+}
+#endif
+
 struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
         size = file->size();
         int fd = file->file_id();
         int flags = MAP_SHARED;
@@ -628,18 +718,34 @@ struct llama_mmap::impl {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
                     strerror(errno));
         }
-        if (prefetch) { flags |= MAP_POPULATE; }
+        // MAP_POPULATE would fault in the lazy ranges too
+        if (prefetch && lazy_ranges.empty()) { flags |= MAP_POPULATE; }
 #endif
         addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
 
-        if (prefetch > 0) {
-            if (posix_madvise(addr, std::min(file->size(), prefetch), POSIX_MADV_WILLNEED)) {
-                LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n",
-                        strerror(errno));
+        // page-aligned madvise over [beg, end), clamped to the file
+        auto advise = [&](size_t beg, size_t end, int advice, const char * name) {
+            const size_t page_size = sysconf(_SC_PAGESIZE);
+            beg = beg & ~(page_size - 1);
+            end = std::min((end + page_size - 1) & ~(page_size - 1), file->size());
+            if (beg >= end) {
+                return;
             }
+            if (posix_madvise((char *) addr + beg, end - beg, advice)) {
+                LLAMA_LOG_WARN("warning: posix_madvise(.., %s) failed: %s\n", name, strerror(errno));
+            }
+        };
+
+        if (prefetch > 0) {
+            for (const auto & range : ranges_complement(lazy_ranges, std::min(file->size(), prefetch))) {
+                advise(range.first, range.second, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
+            }
+        }
+        for (const auto & range : lazy_ranges) {
+            advise(range.first, range.second, POSIX_MADV_RANDOM, "POSIX_MADV_RANDOM");
         }
         if (numa) {
             if (posix_madvise(addr, file->size(), POSIX_MADV_RANDOM)) {
@@ -709,7 +815,7 @@ struct llama_mmap::impl {
 #elif defined(_WIN32)
     HANDLE hMapping = nullptr;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
         GGML_UNUSED(numa);
 
         size = file->size();
@@ -739,10 +845,15 @@ struct llama_mmap::impl {
             pPrefetchVirtualMemory = (decltype(pPrefetchVirtualMemory))(void *) GetProcAddress(hKernel32, "PrefetchVirtualMemory");
 
             if (pPrefetchVirtualMemory) {
-                WIN32_MEMORY_RANGE_ENTRY range;
-                range.VirtualAddress = addr;
-                range.NumberOfBytes = (SIZE_T) std::min(size, prefetch);
-                if (!pPrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0)) {
+                std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
+                for (const auto & range : ranges_complement(lazy_ranges, std::min(size, prefetch))) {
+                    WIN32_MEMORY_RANGE_ENTRY entry;
+                    entry.VirtualAddress = (char *) addr + range.first;
+                    entry.NumberOfBytes  = (SIZE_T) (range.second - range.first);
+                    entries.push_back(entry);
+                }
+                if (!entries.empty() &&
+                        !pPrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR) entries.size(), entries.data(), 0)) {
                     LLAMA_LOG_WARN("warning: PrefetchVirtualMemory failed: %s\n",
                             llama_format_win_err(GetLastError()).c_str());
                 }
@@ -773,10 +884,11 @@ struct llama_mmap::impl {
         }
     }
 #else
-    impl(struct llama_file * file, size_t prefetch, bool numa) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
         GGML_UNUSED(file);
         GGML_UNUSED(prefetch);
         GGML_UNUSED(numa);
+        GGML_UNUSED(lazy_ranges);
 
         throw std::runtime_error("mmap not supported");
     }
@@ -793,7 +905,8 @@ struct llama_mmap::impl {
     size_t size;
 };
 
-llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa) : pimpl(std::make_unique<impl>(file, prefetch, numa)) {}
+llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
+        const ranges & lazy_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges)) {}
 llama_mmap::~llama_mmap() = default;
 
 size_t llama_mmap::size() const { return pimpl->size; }
@@ -949,6 +1062,83 @@ const bool llama_mlock::SUPPORTED = true;
 #else
 const bool llama_mlock::SUPPORTED = false;
 #endif
+
+void llama_prefetch(llama_memory_ranges mr) {
+#if defined(__linux__) || defined(__APPLE__) || (defined(_WIN32) && _WIN32_WINNT >= 0x602)
+    if (mr.empty()) {
+        return;
+    }
+
+#if defined(_WIN32)
+    using prefetch_virtual_memory_t = BOOL (WINAPI *)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+    static const auto pPrefetchVirtualMemory = (prefetch_virtual_memory_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
+    if (!pPrefetchVirtualMemory) {
+        return;
+    }
+
+    static const long page_size = [] {
+        SYSTEM_INFO info;
+        GetSystemInfo(&info);
+        return (long) info.dwPageSize;
+    }();
+#else
+    static const long page_size = sysconf(_SC_PAGESIZE);
+#endif
+    if (page_size <= 0) {
+        return;
+    }
+
+    const size_t page = (size_t) page_size;
+    std::sort(mr.begin(), mr.end(), [](const llama_memory_range & a, const llama_memory_range & b) {
+        return (uintptr_t) a.addr < (uintptr_t) b.addr;
+    });
+
+    uintptr_t begin = 0, end = 0;
+    size_t n_ranges = 0;
+    for (const auto & range : mr) {
+        if (!range.addr || range.size == 0) {
+            continue;
+        }
+        const uintptr_t pointer = (uintptr_t) range.addr;
+        const uintptr_t first = pointer / page * page;
+        const uintptr_t last = (pointer + range.size + page - 1) / page * page;
+        if (end && first > end) {
+            mr[n_ranges++] = { (const void *) begin, end - begin };
+            end = 0;
+        }
+        if (!end) {
+            begin = first;
+        }
+        end = std::max(end, last);
+    }
+    if (end) {
+        mr[n_ranges++] = { (const void *) begin, end - begin };
+    }
+    mr.resize(n_ranges);
+#if defined(_WIN32)
+    // prefetch the merged ranges in one call, so the reads can be issued concurrently
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
+    entries.reserve(mr.size());
+    for (const auto & range : mr) {
+        entries.push_back({ const_cast<PVOID>(range.addr), (SIZE_T) range.size });
+    }
+    if (!entries.empty() && !pPrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR) entries.size(), entries.data(), 0)) {
+        LLAMA_LOG_WARN("llama_prefetch: PrefetchVirtualMemory failed: %s\n",
+                llama_format_win_err(GetLastError()).c_str());
+    }
+#else
+    for (const auto & range : mr) {
+        // TODO: in a follow-up, use posix_madvise(.., POSIX_MADV_WILLNEED) to match the rest of this file
+        if (madvise(const_cast<void *>(range.addr), range.size, MADV_WILLNEED) != 0) {
+            LLAMA_LOG_WARN("llama_prefetch: madvise(MADV_WILLNEED) failed: %s\n", strerror(errno));
+            return;
+        }
+    }
+#endif
+#else
+    GGML_UNUSED(mr);
+#endif
+}
 
 size_t llama_path_max() {
     return PATH_MAX;

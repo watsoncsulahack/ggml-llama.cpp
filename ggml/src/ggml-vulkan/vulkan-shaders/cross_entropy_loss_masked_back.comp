@@ -53,7 +53,7 @@ void main() {
             }
         }
 
-        const FLOAT_TYPE upstream_grad = FLOAT_TYPE(p.param1);
+        const FLOAT_TYPE upstream_grad = FLOAT_TYPE(data_a[0]);
         d_by_valid = valid_tokens > 0.0 ? upstream_grad / valid_tokens : FLOAT_TYPE(0.0);
 
         vals[0] = d_by_valid;
@@ -61,6 +61,7 @@ void main() {
     barrier();
 
     d_by_valid = vals[0];
+    barrier();  // all threads must read vals[0] before it is reused for the max-reduction below
 
     FLOAT_TYPE thread_max = FLOAT_TYPE(uintBitsToFloat(0xFF800000));    // -INFINITY
     for (uint i = tid; i < nclasses; i += warp_size) {

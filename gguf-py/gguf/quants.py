@@ -28,6 +28,7 @@ def quant_shape_from_byte_shape(shape: Sequence[int], quant_type: GGMLQuantizati
 # This is faster than np.vectorize and np.apply_along_axis because it works on more than one row at a time
 def _apply_over_grouped_rows(func: Callable[[np.ndarray], np.ndarray], arr: np.ndarray, otype: DTypeLike, oshape: tuple[int, ...]) -> np.ndarray:
     rows = arr.reshape((-1, arr.shape[-1]))
+    assert len(rows.shape)
     osize = 1
     for dim in oshape:
         osize *= dim
@@ -648,6 +649,59 @@ class TQ2_0(__Quant, qtype=GGMLQuantizationType.TQ2_0):
         d = d.view(np.float16).astype(np.float32)
 
         qs = qs.reshape((n_blocks, -1, 1, 32)) >> np.array([0, 2, 4, 6], dtype=np.uint8).reshape((1, 1, 4, 1))
+        qs = (qs & 0x03).reshape((n_blocks, -1)).astype(np.int8) - np.int8(1)
+
+        return (d * qs.astype(np.float32))
+
+
+class Q1_0(__Quant, qtype=GGMLQuantizationType.Q1_0):
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        # sequential sum like the C reference, np.sum uses pairwise summation and can round differently
+        d = np.cumsum(abs(blocks), axis=-1, dtype=np.float32)[..., -1:] / np.float32(cls.block_size)
+        qs = np.packbits(blocks >= 0, axis=-1, bitorder="little")
+
+        d = d.astype(np.float16).view(np.uint8)
+
+        return np.concatenate([d, qs], axis=-1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        d, qs = np.hsplit(blocks, [2])
+
+        d = d.view(np.float16).astype(np.float32)
+
+        qs = np.unpackbits(qs, axis=-1, bitorder="little")
+
+        return np.where(qs != 0, d, -d)
+
+
+class Q2_0(__Quant, qtype=GGMLQuantizationType.Q2_0):
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        d = abs(blocks).max(axis=-1, keepdims=True)
+        with np.errstate(divide="ignore"):
+            id = np.where(d == 0, 0, 1 / d)
+        qs = (np_roundf(blocks * id) + 1).clip(0, 3).astype(np.uint8)
+
+        qs = qs.reshape((n_blocks, -1, 4)) << np.array([0, 2, 4, 6], dtype=np.uint8)
+        qs = qs[..., 0] | qs[..., 1] | qs[..., 2] | qs[..., 3]
+
+        d = d.astype(np.float16).view(np.uint8)
+
+        return np.concatenate([d, qs], axis=-1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        d, qs = np.hsplit(blocks, [2])
+
+        d = d.view(np.float16).astype(np.float32)
+
+        qs = qs.reshape((n_blocks, -1, 1)) >> np.array([0, 2, 4, 6], dtype=np.uint8)
         qs = (qs & 0x03).reshape((n_blocks, -1)).astype(np.int8) - np.int8(1)
 
         return (d * qs.astype(np.float32))

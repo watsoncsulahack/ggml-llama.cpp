@@ -8,6 +8,18 @@ endif()
 
 find_package(Vulkan COMPONENTS glslc REQUIRED)
 
+if (DEFINED ENV{VULKAN_SDK})
+    list(APPEND CMAKE_PREFIX_PATH "$ENV{VULKAN_SDK}")
+endif()
+# Desktop builds get SPIRV-Headers (and Vulkan-Hpp) from the Vulkan SDK. The
+# Android NDK ships neither, so on Android they are fetched in the ANDROID block
+# below; don't hard-require the system package there.
+if (ANDROID)
+    find_package(SPIRV-Headers CONFIG QUIET)
+else()
+    find_package(SPIRV-Headers CONFIG REQUIRED)
+endif()
+
 if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     # Parallel build object files
     add_definitions(/MP)
@@ -61,7 +73,17 @@ if (Vulkan_FOUND)
     ggml_add_backend_library(ggml-vulkan
                              ggml-vulkan.cpp
                              ../../include/ggml-vulkan.h
+                             ggml-vulkan-types.h
+                             ggml-vulkan-push-constants.h
+                             ggml-vulkan-common.h
+                             ggml-vulkan-buffers.cpp
+                             ggml-vulkan-debug.cpp
                             )
+
+    # hide symbols, so dlclosed duplicate copies cannot interpose them
+    set_target_properties(ggml-vulkan PROPERTIES
+                          CXX_VISIBILITY_PRESET hidden
+                          VISIBILITY_INLINES_HIDDEN ON)
 
     set(VULKAN_SHADER_GEN_CMAKE_ARGS "")
 
@@ -87,6 +109,12 @@ if (Vulkan_FOUND)
     endif()
 
     test_shader_extension_support(
+        "GL_NV_cooperative_matrix_decode_vector"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat2_decode_vector.comp"
+        "GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT"
+    )
+
+    test_shader_extension_support(
         "GL_EXT_integer_dot_product"
         "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/integer_dot.comp"
         "GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT"
@@ -98,6 +126,18 @@ if (Vulkan_FOUND)
         "GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT"
     )
 
+    test_shader_extension_support(
+        "GL_EXT_float_e2m1"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/float_e2m1.comp"
+        "GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT"
+    )
+
+    test_shader_extension_support(
+        "GL_EXT_float_e4m3"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/float_e4m3.comp"
+        "GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT"
+    )
+
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
     target_include_directories(ggml-vulkan
         PRIVATE
@@ -106,7 +146,34 @@ if (Vulkan_FOUND)
 
     )
     if (ANDROID)
-        target_include_directories(ggml-vulkan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/vulkan_cpp_wrapper/include")
+        # The Android NDK ships only the C Vulkan headers (vulkan/vulkan.h). The
+        # ggml Vulkan backend additionally needs the C++ bindings
+        # (vulkan/vulkan.hpp) and SPIRV-Headers (spirv/unified1/spirv.hpp), which
+        # the NDK does not provide. Fetch pinned, header-only copies so the
+        # Android Vulkan build works out of the box.
+        include(FetchContent)
+        # SOURCE_SUBDIR points at a directory without a CMakeLists.txt so that
+        # FetchContent only downloads the headers and does NOT add_subdirectory()
+        # their projects (Vulkan-Headers would otherwise re-declare the
+        # Vulkan::Headers target already created by find_package(Vulkan)).
+        FetchContent_Declare(
+            vulkan_headers
+            GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+            GIT_TAG        vulkan-sdk-1.4.350.1
+            GIT_SHALLOW    TRUE
+            SOURCE_SUBDIR  headers-only-no-build
+        )
+        FetchContent_Declare(
+            spirv_headers
+            GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Headers.git
+            GIT_TAG        vulkan-sdk-1.4.350.1
+            GIT_SHALLOW    TRUE
+            SOURCE_SUBDIR  headers-only-no-build
+        )
+        FetchContent_MakeAvailable(vulkan_headers spirv_headers)
+        target_include_directories(ggml-vulkan PRIVATE
+            "${vulkan_headers_SOURCE_DIR}/include"
+            "${spirv_headers_SOURCE_DIR}/include")
     endif()
 
     if (FORCE_GGML_VK_PERF_LOGGER)
@@ -120,6 +187,9 @@ if (Vulkan_FOUND)
 
     if (GGML_VULKAN_CHECK_RESULTS)
         add_compile_definitions(GGML_VULKAN_CHECK_RESULTS)
+        # the result-checking path computes a CPU reference graph via
+        # ggml_graph_compute_with_ctx(), which is defined in ggml-cpu
+        target_link_libraries(ggml-vulkan PRIVATE ggml-cpu)
     endif()
 
     if (GGML_VULKAN_DEBUG)
@@ -146,6 +216,8 @@ if (Vulkan_FOUND)
 
     if (GGML_VULKAN_RUN_TESTS)
         add_compile_definitions(GGML_VULKAN_RUN_TESTS)
+        # the test path also calls ggml_graph_compute_with_ctx() (ggml-cpu)
+        target_link_libraries(ggml-vulkan PRIVATE ggml-cpu)
     endif()
 
     # Set up toolchain for host compilation whether cross-compiling or not
@@ -200,8 +272,11 @@ if (Vulkan_FOUND)
     set (_ggml_vk_header     "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-shaders.hpp")
     set (_ggml_vk_input_dir  "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders")
     set (_ggml_vk_output_dir "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders.spv")
+    set (_ggml_vk_generated_shader_files ${_ggml_vk_header})
 
     file(GLOB _ggml_vk_shader_files CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.comp")
+    set_source_files_properties(${_ggml_vk_shader_files} PROPERTIES HEADER_FILE_ONLY TRUE)
+    target_sources(ggml-vulkan PRIVATE ${_ggml_vk_shader_files})
 
     # Because external projects do not provide source-level tracking,
     # the vulkan-shaders-gen sources need to be explicitly added to
@@ -244,8 +319,11 @@ if (Vulkan_FOUND)
             COMMENT "Generate vulkan shaders for ${file}"
         )
         target_sources(ggml-vulkan PRIVATE ${_ggml_vk_target_cpp})
+        list(APPEND _ggml_vk_generated_shader_files ${_ggml_vk_target_cpp})
     endforeach()
 
+    source_group("Vulkan shaders" FILES ${_ggml_vk_shader_files})
+    source_group("Generated Vulkan shaders" FILES ${_ggml_vk_generated_shader_files})
 else()
     message(WARNING "Vulkan not found")
 endif()

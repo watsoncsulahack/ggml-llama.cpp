@@ -1,5 +1,6 @@
 #include "arg.h"
 #include "common.h"
+#include "finetune.h"
 #include "log.h"
 #include "llama.h"
 #include "ggml-backend.h"
@@ -157,15 +158,23 @@ static uint32_t parse_lora_modules(const std::string& modules_str) {
     }
 
     static const std::map<std::string, uint32_t> module_map = {
-        {"attn_q",    LLAMA_LORA_TARGET_ATTN_Q},
-        {"attn_k",    LLAMA_LORA_TARGET_ATTN_K},
-        {"attn_v",    LLAMA_LORA_TARGET_ATTN_V},
-        {"attn_o",    LLAMA_LORA_TARGET_ATTN_O},
-        {"ffn_gate",  LLAMA_LORA_TARGET_FFN_GATE},
-        {"ffn_up",    LLAMA_LORA_TARGET_FFN_UP},
-        {"ffn_down",  LLAMA_LORA_TARGET_FFN_DOWN},
-        {"output",    LLAMA_LORA_TARGET_OUTPUT},
-        {"all",       LLAMA_LORA_TARGET_ALL}
+        {"attn_q",           LLAMA_LORA_TARGET_ATTN_Q},
+        {"attn_k",           LLAMA_LORA_TARGET_ATTN_K},
+        {"attn_v",           LLAMA_LORA_TARGET_ATTN_V},
+        {"attn_o",           LLAMA_LORA_TARGET_ATTN_O},
+        {"ffn_gate",         LLAMA_LORA_TARGET_FFN_GATE},
+        {"ffn_up",           LLAMA_LORA_TARGET_FFN_UP},
+        {"ffn_down",         LLAMA_LORA_TARGET_FFN_DOWN},
+        {"output",           LLAMA_LORA_TARGET_OUTPUT},
+        {"ffn_gate_exps",    LLAMA_LORA_TARGET_FFN_GATE_EXPS},
+        {"ffn_up_exps",      LLAMA_LORA_TARGET_FFN_UP_EXPS},
+        {"ffn_down_exps",    LLAMA_LORA_TARGET_FFN_DOWN_EXPS},
+        {"ffn_gate_up_exps", LLAMA_LORA_TARGET_FFN_GATE_UP_EXPS},
+        {"moe_experts",      LLAMA_LORA_TARGET_FFN_GATE_EXPS |
+                             LLAMA_LORA_TARGET_FFN_UP_EXPS |
+                             LLAMA_LORA_TARGET_FFN_DOWN_EXPS |
+                             LLAMA_LORA_TARGET_FFN_GATE_UP_EXPS},
+        {"all",              LLAMA_LORA_TARGET_ALL}
     };
 
     uint32_t target_modules = 0;
@@ -182,7 +191,7 @@ static uint32_t parse_lora_modules(const std::string& modules_str) {
             LOG_INF("Added target module: %s\n", module.c_str());
         } else {
             LOG_ERR("Unknown LoRA target module: %s\n", module.c_str());
-            LOG_ERR("Available modules: attn_q, attn_k, attn_v, attn_o, ffn_gate, ffn_up, ffn_down, output, all\n");
+            LOG_ERR("Available modules: attn_q, attn_k, attn_v, attn_o, ffn_gate, ffn_up, ffn_down, output, ffn_gate_exps, ffn_up_exps, ffn_down_exps, ffn_gate_up_exps, moe_experts, all\n");
             return 0;
         }
     }
@@ -261,13 +270,16 @@ static void print_lora_usage() {
     printf("  --lora-rank N              LoRA rank (default: 8, range: 1-512)\n");
     printf("  --lora-alpha N             LoRA alpha scaling factor (default: 16.0, range: 0.1-1000.0)\n");
     printf("  --lora-modules MODULES     Target modules as comma-separated list (default: attn_q,attn_k,attn_v,attn_o)\n");
-    printf("                             Available modules: attn_q, attn_k, attn_v, attn_o, ffn_gate, ffn_up, ffn_down, output, all\n");
+    printf("                             Available modules: attn_q, attn_k, attn_v, attn_o, ffn_gate, ffn_up, ffn_down, output,\n");
+    printf("                                                ffn_gate_exps, ffn_up_exps, ffn_down_exps, ffn_gate_up_exps, moe_experts, all\n");
     printf("                             Examples: \"attn_q,attn_v\" or \"all\" or \"attn_q,attn_k,attn_v,attn_o,ffn_gate,ffn_up,ffn_down\"\n");
+    printf("                                       \"attn_q,attn_v,moe_experts\" (MoE expert LoRA)\n");
     printf("  --output-adapter PATH      Output path for trained adapter (default: auto-generated)\n");
     printf("\nTraining Options:\n");
     printf("  --num-epochs N             Number of training epochs (default: 1)\n");
     printf("  --assistant-loss-only      Use JSON dataset format with masked loss (ChatML/conversation format)\n");
     printf("                             Only computes loss on assistant responses, not system/user prompts\n");
+    printf("  --train-flash-attn         Keep flash attention enabled during training (needs FLASH_ATTN_EXT_BACK on the backend)\n");
     printf("  --chat-template PATH  Optional Jinja chat template to render JSON dataset (matches HF apply_chat_template)\n");
     printf("  --learning-rate F          AdamW learning rate (default: 1e-5)\n");
     printf("  --weight-decay F           AdamW weight decay (default: 1e-2)\n");
@@ -503,6 +515,7 @@ struct finetune_params {
     bool auto_resume = false;
     std::string chat_template_path;
     bool assistant_loss_only = false;
+    bool train_flash_attn = false;
     uint32_t lora_seed = 42;
 };
 
@@ -524,6 +537,14 @@ static bool parse_finetune_args(int& argc, char** argv, finetune_params& ft_para
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--assistant-loss-only") == 0) {
             ft_params.assistant_loss_only = true;
+            remove_arg_single(i);
+            i--;
+        }
+    }
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--train-flash-attn") == 0) {
+            ft_params.train_flash_attn = true;
             remove_arg_single(i);
             i--;
         }
@@ -687,9 +708,10 @@ int main(int argc, char ** argv) {
         LOG_INF("Checkpoint LoRA adapter added to params\n");
     }
 
-    if (params.use_mmap) {
+    if (params.load_mode == LLAMA_LOAD_MODE_MMAP || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
         LOG_INF("%s: force disabling memory mapping because it would result in-read-only pointers to the weights\n", __func__);
-        params.use_mmap = false;
+        params.load_mode = params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ? LLAMA_LOAD_MODE_MLOCK
+                                                                          : LLAMA_LOAD_MODE_NONE;
     }
     const bool supports_out_prod_f16 = training_supports_out_prod_f16(params);
     if (!supports_out_prod_f16) {
@@ -748,7 +770,8 @@ int main(int argc, char ** argv) {
             return 1;
         }
     } else {
-        LOG_INF("Target modules: Q=%s, K=%s, V=%s, O=%s, GATE=%s, UP=%s, DOWN=%s, OUTPUT=%s\n",
+        LOG_INF("Target modules: Q=%s, K=%s, V=%s, O=%s, GATE=%s, UP=%s, DOWN=%s, OUTPUT=%s, "
+                "GATE_EXPS=%s, UP_EXPS=%s, DOWN_EXPS=%s, GATE_UP_EXPS=%s\n",
             (lora_params.target_modules & LLAMA_LORA_TARGET_ATTN_Q) ? "yes" : "no",
             (lora_params.target_modules & LLAMA_LORA_TARGET_ATTN_K) ? "yes" : "no",
             (lora_params.target_modules & LLAMA_LORA_TARGET_ATTN_V) ? "yes" : "no",
@@ -756,7 +779,11 @@ int main(int argc, char ** argv) {
             (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_GATE) ? "yes" : "no",
             (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_UP) ? "yes" : "no",
             (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_DOWN) ? "yes" : "no",
-            (lora_params.target_modules & LLAMA_LORA_TARGET_OUTPUT) ? "yes" : "no");
+            (lora_params.target_modules & LLAMA_LORA_TARGET_OUTPUT) ? "yes" : "no",
+            (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_GATE_EXPS) ? "yes" : "no",
+            (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_UP_EXPS) ? "yes" : "no",
+            (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_DOWN_EXPS) ? "yes" : "no",
+            (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_GATE_UP_EXPS) ? "yes" : "no");
 
         LOG_INF("LoRA configuration: rank=%d, alpha=%.1f (scaling=%.3f)\n",
                 lora_params.rank, lora_params.alpha, lora_params.alpha / lora_params.rank);
@@ -878,6 +905,7 @@ int main(int argc, char ** argv) {
     lopt_params.checkpoint_path      = checkpoint_loaded ? optimizer_checkpoint_path.c_str() : nullptr;
     lopt_params.load_optimizer_state = checkpoint_loaded;
     lopt_params.assistant_loss_only  = ft_params.assistant_loss_only;
+    lopt_params.flash_attn           = ft_params.train_flash_attn;
 
     llama_opt_init(ctx, model, lopt_params);
 
@@ -933,9 +961,7 @@ int main(int argc, char ** argv) {
             resume_batch = start_step % training_batches_per_epoch;
         }
 
-        ggml_opt_epoch_callback train_callback = (ft_params.checkpoint_save_steps <= 0) ?
-            ggml_opt_epoch_callback_progress_bar : checkpoint_progress_callback;
-        ggml_opt_epoch_callback eval_callback = (ft_params.checkpoint_save_steps <= 0) ?
+        ggml_opt_epoch_callback epoch_callback = (ft_params.checkpoint_save_steps <= 0) ?
             ggml_opt_epoch_callback_progress_bar : checkpoint_progress_callback;
 
         if (resume_batch > 0) {
@@ -947,7 +973,7 @@ int main(int argc, char ** argv) {
         }
 
         llama_opt_epoch_resume(ctx, dataset, result_train, result_eval, idata_split,
-            train_callback, eval_callback, resume_batch);
+            epoch_callback, epoch_callback, resume_batch);
         fprintf(stderr, "\n");
 
         ggml_opt_result_reset(result_train);

@@ -1,4 +1,5 @@
 include(CheckCXXCompilerFlag)
+include(CheckCXXSourceCompiles)
 include("../cmake/common.cmake")
 
 add_compile_definitions(GGML_SCHED_MAX_COPIES=${GGML_SCHED_MAX_COPIES})
@@ -201,6 +202,7 @@ add_library(ggml-base
             ggml-opt.cpp
             ggml-threading.cpp
             ggml-threading.h
+            ggml-tbq-quants.c
             ggml-quants.c
             ggml-quants.h
             gguf.cpp
@@ -211,13 +213,162 @@ set_target_properties(ggml-base PROPERTIES
     SOVERSION ${GGML_VERSION_MAJOR}
 )
 
-target_include_directories(ggml-base PRIVATE .)
+configure_file(ggml-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/ggml-version.h @ONLY)
+
+target_include_directories(ggml-base PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
 if (GGML_BACKEND_DL)
     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
 endif()
 
 if (GGML_SCHED_NO_REALLOC)
     target_compile_definitions(ggml-base PUBLIC GGML_SCHED_NO_REALLOC)
+endif()
+
+if (GGML_OPENMP_FETCH)
+    if (NOT GGML_OPENMP)
+        message(FATAL_ERROR "GGML_OPENMP_FETCH requires GGML_OPENMP")
+    elseif (NOT WIN32 OR NOT (CMAKE_C_COMPILER_ID MATCHES "Clang"))
+        message(FATAL_ERROR "GGML_OPENMP_FETCH currently requires Clang on Windows")
+    endif()
+
+    set(GGML_OPENMP_LLVM_VERSION "20.1.8")
+    string(REGEX MATCH "^[0-9]+" GGML_OPENMP_LLVM_VERSION_MAJOR "${GGML_OPENMP_LLVM_VERSION}")
+    string(REGEX MATCH "^[0-9]+" GGML_OPENMP_COMPILER_VERSION_MAJOR "${CMAKE_C_COMPILER_VERSION}")
+    if (NOT GGML_OPENMP_COMPILER_VERSION_MAJOR STREQUAL GGML_OPENMP_LLVM_VERSION_MAJOR)
+        message(FATAL_ERROR "LLVM OpenMP ${GGML_OPENMP_LLVM_VERSION} requires Clang ${GGML_OPENMP_LLVM_VERSION_MAJOR}.x")
+    endif()
+
+    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" GGML_OPENMP_SYSTEM_PROCESSOR)
+    if (GGML_OPENMP_SYSTEM_PROCESSOR MATCHES "^(amd64|x86_64)$")
+        set(GGML_OPENMP_ARCH "x64")
+        set(GGML_OPENMP_INSTALLER_SUFFIX "win64")
+        set(GGML_OPENMP_INSTALLER_SHA256 "3197846a2b19063687dd56e93e34cd941e3548d907f23a6131571321bdf9fe7b")
+    elseif (GGML_OPENMP_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+        set(GGML_OPENMP_ARCH "arm64")
+        set(GGML_OPENMP_INSTALLER_SUFFIX "woa64")
+        set(GGML_OPENMP_INSTALLER_SHA256 "7c4ac97eb2ae6b960ca5f9caf3ff6124c8d2a18cc07a7840a4d2ea15537bad8e")
+    else()
+        message(FATAL_ERROR "GGML_OPENMP_FETCH does not support ${CMAKE_SYSTEM_PROCESSOR}")
+    endif()
+
+    set(GGML_OPENMP_CACHE_DIR "${CMAKE_BINARY_DIR}/_deps")
+    set(GGML_OPENMP_ROOT "${GGML_OPENMP_CACHE_DIR}/llvm-openmp-${GGML_OPENMP_LLVM_VERSION}-${GGML_OPENMP_ARCH}")
+    set(GGML_OPENMP_LIBRARY "${GGML_OPENMP_ROOT}/lib/libomp.lib")
+    set(GGML_OPENMP_RUNTIME "${GGML_OPENMP_ROOT}/bin/libomp.dll")
+    set(GGML_OPENMP_HEADER "${GGML_OPENMP_ROOT}/include/omp.h")
+    set(GGML_OPENMP_LICENSE "${GGML_OPENMP_ROOT}/LICENSE.TXT")
+    set(GGML_OPENMP_LICENSE_SHA256 "fdad1758a9e1f9d5a81e18879b3406772115edc92c24bfa36b70c654f325e8e4")
+
+    if (NOT EXISTS "${GGML_OPENMP_LIBRARY}" OR NOT EXISTS "${GGML_OPENMP_RUNTIME}" OR NOT EXISTS "${GGML_OPENMP_HEADER}")
+        find_program(GGML_OPENMP_7Z NAMES 7z 7zz 7za)
+        if (NOT GGML_OPENMP_7Z)
+            message(FATAL_ERROR "GGML_OPENMP_FETCH requires 7-Zip to extract the LLVM installer")
+        endif()
+
+        set(GGML_OPENMP_INSTALLER "${GGML_OPENMP_ROOT}/LLVM-${GGML_OPENMP_LLVM_VERSION}-${GGML_OPENMP_INSTALLER_SUFFIX}.exe")
+        set(GGML_OPENMP_EXTRACT_DIR "${GGML_OPENMP_ROOT}/extract")
+        set(GGML_OPENMP_INSTALLER_URL "https://github.com/llvm/llvm-project/releases/download/llvmorg-${GGML_OPENMP_LLVM_VERSION}/LLVM-${GGML_OPENMP_LLVM_VERSION}-${GGML_OPENMP_INSTALLER_SUFFIX}.exe")
+
+        file(MAKE_DIRECTORY "${GGML_OPENMP_EXTRACT_DIR}")
+        file(DOWNLOAD "${GGML_OPENMP_INSTALLER_URL}" "${GGML_OPENMP_INSTALLER}"
+            EXPECTED_HASH "SHA256=${GGML_OPENMP_INSTALLER_SHA256}"
+            SHOW_PROGRESS
+            STATUS GGML_OPENMP_DOWNLOAD_STATUS)
+        list(GET GGML_OPENMP_DOWNLOAD_STATUS 0 GGML_OPENMP_DOWNLOAD_RESULT)
+        if (NOT GGML_OPENMP_DOWNLOAD_RESULT EQUAL 0)
+            list(GET GGML_OPENMP_DOWNLOAD_STATUS 1 GGML_OPENMP_DOWNLOAD_ERROR)
+            message(FATAL_ERROR "Failed to download LLVM OpenMP: ${GGML_OPENMP_DOWNLOAD_ERROR}")
+        endif()
+
+        execute_process(
+            COMMAND "${GGML_OPENMP_7Z}" e -y "-o${GGML_OPENMP_EXTRACT_DIR}" "${GGML_OPENMP_INSTALLER}" -r libomp.lib libomp.dll omp.h
+            RESULT_VARIABLE GGML_OPENMP_EXTRACT_RESULT
+            OUTPUT_QUIET)
+        if (NOT GGML_OPENMP_EXTRACT_RESULT EQUAL 0 OR
+            NOT EXISTS "${GGML_OPENMP_EXTRACT_DIR}/libomp.lib" OR
+            NOT EXISTS "${GGML_OPENMP_EXTRACT_DIR}/libomp.dll" OR
+            NOT EXISTS "${GGML_OPENMP_EXTRACT_DIR}/omp.h")
+            message(FATAL_ERROR "Failed to extract libomp from ${GGML_OPENMP_INSTALLER}")
+        endif()
+
+        file(MAKE_DIRECTORY "${GGML_OPENMP_ROOT}/lib" "${GGML_OPENMP_ROOT}/bin" "${GGML_OPENMP_ROOT}/include")
+        file(COPY "${GGML_OPENMP_EXTRACT_DIR}/libomp.lib" DESTINATION "${GGML_OPENMP_ROOT}/lib")
+        file(COPY "${GGML_OPENMP_EXTRACT_DIR}/libomp.dll" DESTINATION "${GGML_OPENMP_ROOT}/bin")
+        file(COPY "${GGML_OPENMP_EXTRACT_DIR}/omp.h" DESTINATION "${GGML_OPENMP_ROOT}/include")
+        file(REMOVE_RECURSE "${GGML_OPENMP_INSTALLER}" "${GGML_OPENMP_EXTRACT_DIR}")
+    endif()
+
+    # The NSIS installer embeds LLVM's general license in its UI but does not install it as a file; use OpenMP's license to include its additional notices.
+    if (EXISTS "${GGML_OPENMP_LICENSE}")
+        file(SHA256 "${GGML_OPENMP_LICENSE}" GGML_OPENMP_LICENSE_ACTUAL_SHA256)
+    endif()
+    if (NOT GGML_OPENMP_LICENSE_ACTUAL_SHA256 STREQUAL GGML_OPENMP_LICENSE_SHA256)
+        file(DOWNLOAD "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-${GGML_OPENMP_LLVM_VERSION}/openmp/LICENSE.TXT" "${GGML_OPENMP_LICENSE}"
+            EXPECTED_HASH "SHA256=${GGML_OPENMP_LICENSE_SHA256}")
+    endif()
+
+    if (COMMAND license_add_file)
+        license_add_file("LLVM OpenMP" "${GGML_OPENMP_LICENSE}")
+    endif()
+
+    add_library(ggml-openmp-c INTERFACE)
+    target_compile_options(ggml-openmp-c INTERFACE "$<$<COMPILE_LANGUAGE:C>:-fopenmp=libomp>")
+    target_include_directories(ggml-openmp-c SYSTEM INTERFACE "${GGML_OPENMP_ROOT}/include")
+    target_link_libraries(ggml-openmp-c INTERFACE "${GGML_OPENMP_LIBRARY}")
+
+    add_library(ggml-openmp-cxx INTERFACE)
+    target_compile_options(ggml-openmp-cxx INTERFACE "$<$<COMPILE_LANGUAGE:CXX>:-fopenmp=libomp>")
+    target_include_directories(ggml-openmp-cxx SYSTEM INTERFACE "${GGML_OPENMP_ROOT}/include")
+    target_link_libraries(ggml-openmp-cxx INTERFACE "${GGML_OPENMP_LIBRARY}")
+
+    set(GGML_OPENMP_RUNTIME_OUTPUT_DIR "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+    if (CMAKE_CONFIGURATION_TYPES)
+        string(APPEND GGML_OPENMP_RUNTIME_OUTPUT_DIR "/$<CONFIG>")
+    endif()
+    add_custom_target(ggml-openmp-runtime ALL
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${GGML_OPENMP_RUNTIME_OUTPUT_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${GGML_OPENMP_RUNTIME}" "${GGML_OPENMP_RUNTIME_OUTPUT_DIR}/libomp.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${GGML_OPENMP_LICENSE}" "${GGML_OPENMP_RUNTIME_OUTPUT_DIR}/LICENSE-LLVM-OpenMP")
+    add_dependencies(ggml-base ggml-openmp-runtime)
+    install(FILES "${GGML_OPENMP_RUNTIME}" DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(FILES "${GGML_OPENMP_LICENSE}" DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME LICENSE-LLVM-OpenMP)
+
+    set(GGML_OPENMP_TARGET_C ggml-openmp-c)
+    set(GGML_OPENMP_TARGET_CXX ggml-openmp-cxx)
+    set(GGML_OPENMP_ENABLED "ON" CACHE INTERNAL "")
+elseif (GGML_OPENMP)
+    find_package(OpenMP)
+    if (OpenMP_FOUND)
+        set(GGML_OPENMP_TARGET_C OpenMP::OpenMP_C)
+        set(GGML_OPENMP_TARGET_CXX OpenMP::OpenMP_CXX)
+        set(GGML_OPENMP_ENABLED "ON" CACHE INTERNAL "")
+    else()
+        set(GGML_OPENMP_ENABLED "OFF" CACHE INTERNAL "")
+        message(WARNING "OpenMP not found")
+    endif()
+else()
+    set(GGML_OPENMP_ENABLED "OFF" CACHE INTERNAL "")
+endif()
+
+# The GGML_OPENMP_FETCH helper targets are plain build-tree targets outside
+# the ggml-targets export set; ggml-base and the backends link them PRIVATE,
+# which for static libraries still lands in the exported link interface as
+# $<LINK_ONLY:...>, so install(EXPORT) fails with "requires target
+# ggml-openmp-c that is not in any export set". Wrap them so the installed
+# export drops them; static consumers reconstruct the OpenMP linkage through
+# find_dependency(OpenMP) in ggml-config.cmake.in.
+if (TARGET ggml-openmp-c)
+    set(GGML_OPENMP_TARGET_C   "$<BUILD_INTERFACE:${GGML_OPENMP_TARGET_C}>")
+    set(GGML_OPENMP_TARGET_CXX "$<BUILD_INTERFACE:${GGML_OPENMP_TARGET_CXX}>")
+endif()
+
+if (GGML_OPENMP_ENABLED)
+    target_compile_definitions(ggml-base PRIVATE GGML_USE_OPENMP)
+    target_link_libraries(ggml-base PRIVATE ${GGML_OPENMP_TARGET_C} ${GGML_OPENMP_TARGET_CXX})
+endif()
+
+if (DEFINED GGML_MAX_NAME)
+    target_compile_definitions(ggml-base PUBLIC GGML_MAX_NAME=${GGML_MAX_NAME})
 endif()
 
 add_library(ggml
@@ -243,9 +394,36 @@ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
     target_link_libraries(ggml PRIVATE dl)
 endif()
 
+if (GGML_VECTOR_INDEX)
+    add_subdirectory(ggml-vector-index)
+endif()
+
+# Windows with a static ggml-base: GGML_API exports nothing, so a backend module does not export the logger
+# functions that the loader uses to forward its log lines (ggml-backend-reg.cpp). Export them with the linker.
+# MinGW ld has no /EXPORT, so it is not covered.
+function(ggml_backend_export_log_functions target)
+    if (WIN32 AND NOT BUILD_SHARED_LIBS AND (MSVC OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC"))
+        target_link_options(${target} PRIVATE
+            "LINKER:/EXPORT:ggml_log_set"
+            "LINKER:/EXPORT:ggml_log_get"
+            "LINKER:/EXPORT:ggml_log_callback_default")
+    endif()
+endfunction()
+
 function(ggml_add_backend_library backend)
+    if (GGML_BACKEND_EMBEDDED)
+        # static copy linked into another backend module: not loadable, not installed, not exported
+        add_library(${backend} STATIC ${ARGN})
+        set_target_properties(${backend} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        target_compile_definitions(${backend} PRIVATE GGML_BACKEND_EMBEDDED)
+        target_link_libraries(${backend} PRIVATE ggml-base)
+        target_include_directories(${backend} PRIVATE ..)
+        return()
+    endif()
+
     if (GGML_BACKEND_DL)
         add_library(${backend} MODULE ${ARGN})
+        ggml_backend_export_log_functions(${backend})
         # write the shared library to the output directory
         # Set output name with qvac- prefix to match backend_filename_prefix() in ggml-backend-reg.cpp
         set_target_properties(${backend} PROPERTIES
@@ -257,16 +435,17 @@ function(ggml_add_backend_library backend)
         # with cmake-bare
         # add_dependencies(ggml ${backend})
 
+        # the component lets a build that makes one module install just that module
         if (GGML_BACKEND_DIR)
             install(TARGETS ${backend}
                     EXPORT ggml-targets
-                    LIBRARY DESTINATION ${GGML_BACKEND_DIR}
-                    RUNTIME DESTINATION ${GGML_BACKEND_DIR})
+                    LIBRARY DESTINATION ${GGML_BACKEND_DIR} COMPONENT ${backend}
+                    RUNTIME DESTINATION ${GGML_BACKEND_DIR} COMPONENT ${backend})
         else()
             install(TARGETS ${backend}
                     EXPORT ggml-targets
-                    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-                    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+                    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT ${backend}
+                    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT ${backend})
         endif()
     else()
         add_library(${backend} ${ARGN})
@@ -340,6 +519,8 @@ function(ggml_add_cpu_backend_variant tag_name)
             set(GGML_INTERNAL_${feat} ON)
         endforeach()
     elseif (GGML_SYSTEM_ARCH STREQUAL "s390x")
+        set(GGML_NATIVE OFF)
+
         foreach (feat VXE2 NNPA)
             set(GGML_INTERNAL_${feat} OFF)
         endforeach()
@@ -399,14 +580,24 @@ if (GGML_CPU_ALL_VARIANTS)
             # Many of these features are optional so we build versions with popular
             # combinations and name the backends based on the version they were
             # first released with
+            # qvac: SVE/SVE2 CPU-variant kernels are numerically broken on real
+            # linux-arm64 hardware (Graviton3/Neoverse-V1) — vla/pi05 integration
+            # diverges from the PyTorch reference (cos ~0.77 vs ~0.999) only when
+            # an SVE-enabled variant is runtime-selected; the same model on a
+            # non-SVE variant matches at ~0.999. Strip *only* SVE/SVE2 here (keep
+            # DOTPROD/FP16/i8mm and SME, which are not implicated). armv9.2_1 gets
+            # explicit NOSVE because ARMv9-A mandates SVE2, so -march=armv9.2-a+sme
+            # would otherwise re-enable SVE code paths even with SVE off the
+            # feature list (mirrors the apple_m4 NOSVE+SME variant). armv8.6_1
+            # needs no NOSVE — ARMv8 does not imply SVE. Variants that collapse to
+            # an already-listed feature set after the strip are dropped
+            # (armv8.2_3->8.2_2, armv8.6_2->8.6_1, armv9.2_2->9.2_1).
+            # Android / Apple / other platforms are intentionally untouched.
             ggml_add_cpu_backend_variant(armv8.0_1)
             ggml_add_cpu_backend_variant(armv8.2_1    DOTPROD)
             ggml_add_cpu_backend_variant(armv8.2_2    DOTPROD FP16_VECTOR_ARITHMETIC)
-            ggml_add_cpu_backend_variant(armv8.2_3    DOTPROD FP16_VECTOR_ARITHMETIC SVE)
-            ggml_add_cpu_backend_variant(armv8.6_1    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8)
-            ggml_add_cpu_backend_variant(armv8.6_2    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SVE2)
-            ggml_add_cpu_backend_variant(armv9.2_1    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SME)
-            ggml_add_cpu_backend_variant(armv9.2_2    DOTPROD FP16_VECTOR_ARITHMETIC SVE MATMUL_INT8 SVE2 SME)
+            ggml_add_cpu_backend_variant(armv8.6_1    DOTPROD FP16_VECTOR_ARITHMETIC MATMUL_INT8)
+            ggml_add_cpu_backend_variant(armv9.2_1    DOTPROD FP16_VECTOR_ARITHMETIC MATMUL_INT8 NOSVE SME)
         elseif (CMAKE_SYSTEM_NAME MATCHES "Android")
             # Android-specific backends with SoC-compatible feature sets
             ggml_add_cpu_backend_variant(android_armv8.0_1)
@@ -424,7 +615,7 @@ if (GGML_CPU_ALL_VARIANTS)
             message(FATAL_ERROR "Unsupported ARM target OS: ${CMAKE_SYSTEM_NAME}")
         endif()
     elseif (GGML_SYSTEM_ARCH STREQUAL "PowerPC")
-        if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+        if (CMAKE_SYSTEM_NAME MATCHES "Linux|AIX")
             ggml_add_cpu_backend_variant(power0)
             ggml_add_cpu_backend_variant(power7_1       POWER7)
             ggml_add_cpu_backend_variant(power7_2       POWER7  VSX)
@@ -432,7 +623,14 @@ if (GGML_CPU_ALL_VARIANTS)
             ggml_add_cpu_backend_variant(power8_2       POWER8  VSX)
             ggml_add_cpu_backend_variant(power9         POWER9  VSX)
             ggml_add_cpu_backend_variant(power10        POWER10 VSX)
-            ggml_add_cpu_backend_variant(power11        POWER11 VSX)
+            # POWER11 backend: only if compiler supports -mcpu=power11
+            check_cxx_compiler_flag("-mcpu=power11" GGML_CXX_SUPPORTS_POWER11)
+            if (GGML_CXX_SUPPORTS_POWER11)
+                message(STATUS "Compiler supports -mcpu=power11, enabling POWER11 backend")
+                ggml_add_cpu_backend_variant(power11 POWER11 VSX)
+            else()
+                message(STATUS "Skipping POWER11 backend: compiler does not support -mcpu=power11")
+            endif()
         else()
             message(FATAL_ERROR "Unsupported PowerPC target OS: ${CMAKE_SYSTEM_NAME}")
         endif()
@@ -440,6 +638,14 @@ if (GGML_CPU_ALL_VARIANTS)
         if (CMAKE_SYSTEM_NAME MATCHES "Linux")
             ggml_add_cpu_backend_variant(z15    Z15 VXE2)
             ggml_add_cpu_backend_variant(z16    Z16 VXE2 NNPA)
+
+            # check if compiler supports "-march=z17" codename
+            check_cxx_compiler_flag("-march=arch15" GGML_CXX_SUPPORTS_Z17)
+            if (GGML_CXX_SUPPORTS_Z17)
+                ggml_add_cpu_backend_variant(arch15 Z17 VXE2 NNPA)
+            else()
+                message(WARNING "Skipping z17 target: compiler must be GCC 15.1 and later")
+            endif()
         else()
             message(FATAL_ERROR "Unsupported s390x target OS: ${CMAKE_SYSTEM_NAME}")
         endif()
@@ -457,9 +663,23 @@ elseif (GGML_CPU)
     ggml_add_cpu_backend_variant_impl("")
 endif()
 
+# ggml-xdna runs host ops on a CPU backend; a DL module cannot link the CPU modules, so it gets its own copy (every XDNA host has zen4 features)
+if (GGML_XDNA AND GGML_BACKEND_DL)
+    if (NOT GGML_SYSTEM_ARCH STREQUAL "x86")
+        message(FATAL_ERROR "ggml-xdna is x86-only")
+    endif()
+    if (NOT GGML_CPU)
+        include(ggml-cpu/CMakeLists.txt)
+    endif()
+    set(GGML_BACKEND_EMBEDDED ON)
+    ggml_add_cpu_backend_variant(xdna SSE42 AVX F16C FMA AVX2 BMI2 AVX512 AVX512_VBMI AVX512_VNNI AVX512_BF16)
+    unset(GGML_BACKEND_EMBEDDED)
+endif()
+
 ggml_add_backend(BLAS)
 ggml_add_backend(CANN)
 ggml_add_backend(CUDA)
+ggml_add_backend(ET)
 ggml_add_backend(HIP)
 ggml_add_backend(METAL)
 ggml_add_backend(MUSA)
@@ -471,21 +691,26 @@ ggml_add_backend(WebGPU)
 ggml_add_backend(zDNN)
 ggml_add_backend(OpenCL)
 ggml_add_backend(Hexagon)
+ggml_add_backend(XDNA)
 ggml_add_backend(ZenDNN)
 ggml_add_backend(OPENVINO)
 
-foreach (target ggml-base ggml)
+set(GGML_CORE_TARGETS ggml-base ggml)
+if (GGML_VECTOR_INDEX)
+    list(APPEND GGML_CORE_TARGETS ggml-vector-index)
+endif()
+
+foreach (target ${GGML_CORE_TARGETS})
     target_include_directories(${target} PUBLIC    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include> $<INSTALL_INTERFACE:include>)
     target_compile_features   (${target} PRIVATE c_std_11 cxx_std_17) # don't bump
 endforeach()
 
 target_link_libraries(ggml-base PRIVATE Threads::Threads)
 
-find_library(MATH_LIBRARY m)
-if (MATH_LIBRARY)
-    if (NOT WIN32 OR NOT DEFINED ENV{ONEAPI_ROOT})
-        target_link_libraries(ggml-base PRIVATE m)
-    endif()
+if (DEFINED MATH_LIBRARY)
+    target_link_libraries(ggml-base PRIVATE ${MATH_LIBRARY})
+elseif (NOT WIN32 AND NOT DEFINED ENV{ONEAPI_ROOT})
+    target_link_libraries(ggml-base PRIVATE m)
 endif()
 
 if (CMAKE_SYSTEM_NAME MATCHES "Android")
@@ -497,9 +722,17 @@ if(CMAKE_SYSTEM_NAME MATCHES "visionOS")
 endif()
 
 if (BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
-    foreach (target ggml-base ggml)
+    foreach (target ${GGML_CORE_TARGETS})
         set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        if (target STREQUAL "ggml-base" OR target STREQUAL "ggml")
+            set_target_properties(${target} PROPERTIES
+                C_VISIBILITY_PRESET hidden
+                CXX_VISIBILITY_PRESET hidden
+            )
+        endif()
         target_compile_definitions(${target} PRIVATE GGML_BUILD)
-        target_compile_definitions(${target} PUBLIC  GGML_SHARED)
+        if (BUILD_SHARED_LIBS OR NOT WIN32)
+            target_compile_definitions(${target} PUBLIC  GGML_SHARED)
+        endif()
     endforeach()
 endif()

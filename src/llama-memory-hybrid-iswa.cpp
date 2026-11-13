@@ -24,6 +24,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                  uint32_t   rs_size,
                             /* common */
                  uint32_t   n_seq_max,
+                 uint32_t   n_rs_seq,
                      bool   offload,
                      bool   unified,
                             /* layer filters */
@@ -42,9 +43,11 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         n_seq_max,
         n_ubatch,
         n_pad,
+        nullptr,
         filter_attn == nullptr ?
-            [&](int32_t il) { return !hparams.is_recurrent(il); }
+            [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
+        nullptr,
         nullptr
     )),
     mem_recr(new llama_memory_recurrent(
@@ -54,8 +57,9 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         offload,
         rs_size,
         n_seq_max,
+        n_rs_seq,
         filter_recr == nullptr ?
-            [&](int32_t il) { return hparams.is_recurrent(il); }
+            [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
     )) {}
 
@@ -75,7 +79,13 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
             } else {
                 // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
                 const bool unified = (mem_attn->get_base()->get_n_stream() == 1);
-                ubatch = balloc.split_equal(n_ubatch, !unified);
+
+                // [TAG_RECURRENT_ROLLBACK_SPLITS]
+                // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
+                //   so that the rollback snapshots remain valid
+                const uint32_t n_rs_seq = mem_recr->n_rs_seq;
+
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
             }
 
             if (ubatch.n_tokens == 0) {
@@ -172,6 +182,12 @@ llama_pos llama_memory_hybrid_iswa::seq_pos_min(llama_seq_id seq_id) const {
 llama_pos llama_memory_hybrid_iswa::seq_pos_max(llama_seq_id seq_id) const {
     // the max of the total cache is the min of the two caches' max values
     return std::min(mem_attn->seq_pos_max(seq_id), mem_recr->seq_pos_max(seq_id));
+}
+
+uint32_t llama_memory_hybrid_iswa::seq_token_count(llama_seq_id seq_id) const {
+    return std::max(
+        mem_attn->seq_token_count(seq_id),
+        mem_recr->seq_token_count(seq_id));
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_breakdown() const {
