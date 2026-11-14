@@ -1,0 +1,101 @@
+name: Android ARM64 CLBlast build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["clblast-legacy"]
+
+jobs:
+  android-clblast:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          log-accepted-android-sdk-licenses: false
+
+      - name: Install Android NDK and dependencies
+        run: |
+          sdkmanager "ndk;27.2.12479018"
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build opencl-headers zip
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Build CLBlast for Android ARM64
+        run: |
+          mkdir -p /tmp/opencl-stub
+          cat << 'EOF' > /tmp/opencl-stub/stub.c
+          void clGetPlatformIDs() {}
+          void clGetPlatformInfo() {}
+          void clGetDeviceIDs() {}
+          void clGetDeviceInfo() {}
+          void clCreateContext() {}
+          void clCreateContextFromType() {}
+          void clRetainContext() {}
+          void clReleaseContext() {}
+          void clGetContextInfo() {}
+          void clCreateCommandQueue() {}
+          void clRetainCommandQueue() {}
+          void clReleaseCommandQueue() {}
+          void clGetCommandQueueInfo() {}
+          void clCreateBuffer() {}
+          void clRetainMemObject() {}
+          void clReleaseMemObject() {}
+          void clGetMemObjectInfo() {}
+          void clCreateProgramWithSource() {}
+          void clCreateProgramWithBinary() {}
+          void clRetainProgram() {}
+          void clReleaseProgram() {}
+          void clBuildProgram() {}
+          void clGetProgramBuildInfo() {}
+          void clCreateKernel() {}
+          void clRetainKernel() {}
+          void clReleaseKernel() {}
+          void clSetKernelArg() {}
+          void clGetKernelWorkGroupInfo() {}
+          void clWaitForEvents() {}
+          void clGetEventInfo() {}
+          void clRetainEvent() {}
+          void clReleaseEvent() {}
+          void clGetEventProfilingInfo() {}
+          void clFlush() {}
+          void clFinish() {}
+          void clEnqueueReadBuffer() {}
+          void clEnqueueWriteBuffer() {}
+          void clEnqueueCopyBuffer() {}
+          void clEnqueueNDRangeKernel() {}
+          void clEnqueueTask() {}
+          void clCreateSubBuffer() {}
+          void clEnqueueMapBuffer() {}
+          void clEnqueueUnmapMemObject() {}
+          EOF
+          $ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-clang             -shared /tmp/opencl-stub/stub.c -o /tmp/opencl-stub/libOpenCL.so -Wl,-soname,libOpenCL.so
+
+          git clone --depth 1 https://github.com/CNugteren/CLBlast.git /tmp/CLBlast
+          cmake -B /tmp/clblast-build -S /tmp/CLBlast -G Ninja             -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake"             -DANDROID_ABI=arm64-v8a             -DANDROID_PLATFORM=android-28             -DANDROID_STL=c++_shared             -DCMAKE_BUILD_TYPE=Release             -DOPENCL_INCLUDE_DIRS=/usr/include             -DOPENCL_LIBRARIES=/tmp/opencl-stub/libOpenCL.so             -DBUILD_SHARED_LIBS=ON             -DCLIENTS=OFF             -DTUNERS=OFF
+          cmake --build /tmp/clblast-build -j "$(nproc)"
+
+      - name: Configure llama.cpp with CLBlast
+        run: |
+          cmake -B build-android -G Ninja             -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake"             -DANDROID_ABI=arm64-v8a             -DANDROID_PLATFORM=android-28             -DANDROID_STL=c++_shared             -DCMAKE_BUILD_TYPE=Release             -DGGML_NATIVE=OFF             -DGGML_CPU_ARM_ARCH=armv8.2-a+fp16             -DLLAMA_CLBLAST=ON             -DCLBLAST_INCLUDE_DIRS="/tmp/CLBlast/include"             -DCLBLAST_LIBRARIES="/tmp/clblast-build/libclblast.so"             -DOpenCL_INCLUDE_DIRS=/usr/include             -DOpenCL_LIBRARY=/tmp/opencl-stub/libOpenCL.so             -DLLAMA_BUILD_TESTS=OFF             -DLLAMA_BUILD_SERVER=OFF             -DLLAMA_BUILD_EXAMPLES=ON
+
+      - name: Build main and llama-bench
+        run: cmake --build build-android --target main llama-bench -j "$(nproc)"
+
+      - name: Package artifacts
+        run: |
+          mkdir -p package/android-arm64-clblast
+          cp build-android/bin/main package/android-arm64-clblast/llama-cli
+          cp build-android/bin/llama-bench package/android-arm64-clblast/
+          cp /tmp/clblast-build/libclblast.so package/android-arm64-clblast/
+          cp "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" package/android-arm64-clblast/
+          (cd package && zip -r ../android-arm64-clblast-binaries.zip android-arm64-clblast)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-arm64-clblast-binaries
+          path: android-arm64-clblast-binaries.zip
